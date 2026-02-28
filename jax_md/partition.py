@@ -907,19 +907,17 @@ def neighbor_list(
   metric_sq = _displacement_or_metric_to_metric_sq(displacement_or_metric)
   sparse_allocation_jit_threshold = 4096
 
-  def direct_sparse_supported(kwargs) -> bool:
+  def direct_sparse_supported() -> bool:
     return (
       sparse_backend == 'direct'
       and is_sparse(format)
       and not disable_cell_list
       and custom_mask_function is None
-      and not fractional_coordinates
-      and 'box' not in kwargs
     )
 
   allocation_cell_size = None
   allocation_cl_fn = None
-  if direct_sparse_supported({}):
+  if direct_sparse_supported() and not fractional_coordinates:
     allocation_cell_size = cutoff
     if bool(jax.device_get(jnp.all(allocation_cell_size < box / 3.0))):
       allocation_cl_fn = cell_list(box, allocation_cell_size, capacity_multiplier)
@@ -1152,7 +1150,7 @@ def neighbor_list(
       else:
         err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
         cl_capacity = cl.cell_capacity
-        if direct_sparse_supported(kwargs):
+        if direct_sparse_supported():
           if max_occupancy is None:
             if position.shape[0] >= sparse_allocation_jit_threshold:
               raw_count = raw_edge_count_jit(position, cl, **kwargs)
@@ -1230,7 +1228,7 @@ def neighbor_list(
 
     nbrs = neighbors
     if nbrs is None:
-      if allocation_cl_fn is not None and direct_sparse_supported(kwargs):
+      if allocation_cl_fn is not None and 'box' not in kwargs:
         cl = allocation_cl_fn.allocate(position, extra_capacity=extra_capacity)
         err = PartitionError(jnp.zeros((), jnp.uint8))
         err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
