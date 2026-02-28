@@ -205,6 +205,36 @@ class NeighborListTest(test_util.JAXMDTestCase):
       int(jax.device_get(direct_nbrs.error.code)),
     )
 
+  def _neighbor_fn_pair(
+    self, displacement, box, cutoff, dr_threshold, **kwargs
+  ):
+    legacy_fn = partition.neighbor_list(
+      displacement, box, cutoff, dr_threshold, 1.1, **kwargs
+    )
+    direct_fn = partition.neighbor_list(
+      displacement,
+      box,
+      cutoff,
+      dr_threshold,
+      1.1,
+      sparse_backend='direct',
+      **kwargs,
+    )
+    return legacy_fn, direct_fn
+
+  def _allocate_pair(self, legacy_fn, direct_fn, position, **kwargs):
+    legacy_nbrs = legacy_fn.allocate(position, **kwargs)
+    direct_nbrs = direct_fn.allocate(position, **kwargs)
+    self._assert_sparse_neighbors_match(legacy_nbrs, direct_nbrs)
+    return legacy_nbrs, direct_nbrs
+
+  def _update_pair(self, legacy_nbrs, direct_nbrs, position, **kwargs):
+    update = jit(lambda pos, nbrs: nbrs.update(pos, **kwargs))
+    legacy_updated = update(position, legacy_nbrs)
+    direct_updated = update(position, direct_nbrs)
+    self._assert_sparse_neighbors_match(legacy_updated, direct_updated)
+    return legacy_updated, direct_updated
+
   @parameterized.named_parameters(
     test_util.cases_from_list(
       {
@@ -292,34 +322,11 @@ class NeighborListTest(test_util.JAXMDTestCase):
     moved = R.at[0, 0].add(dr_threshold)
     moved = np.mod(moved, box_size)
 
-    legacy_fn = partition.neighbor_list(
-      displacement,
-      box_size,
-      cutoff,
-      dr_threshold,
-      1.1,
-      format=format,
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
+      displacement, box_size, cutoff, dr_threshold, format=format
     )
-    direct_fn = partition.neighbor_list(
-      displacement,
-      box_size,
-      cutoff,
-      dr_threshold,
-      1.1,
-      format=format,
-      sparse_backend='direct',
-    )
-
-    legacy_nbrs = legacy_fn.allocate(R)
-    direct_nbrs = direct_fn.allocate(R)
-
-    self._assert_sparse_neighbors_match(legacy_nbrs, direct_nbrs)
-
-    update = jit(lambda pos, nbrs: nbrs.update(pos))
-    legacy_updated = update(moved, legacy_nbrs)
-    direct_updated = update(moved, direct_nbrs)
-
-    self._assert_sparse_neighbors_match(legacy_updated, direct_updated)
+    legacy_nbrs, direct_nbrs = self._allocate_pair(legacy_fn, direct_fn, R)
+    self._update_pair(legacy_nbrs, direct_nbrs, moved)
 
   @parameterized.named_parameters(
     test_util.cases_from_list(
@@ -356,34 +363,18 @@ class NeighborListTest(test_util.JAXMDTestCase):
     moved = R.at[0, 0].add(dtype(0.2))
     moved = np.mod(moved, dtype(1.0))
 
-    legacy_fn = partition.neighbor_list(
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
       displacement,
       box,
       cutoff,
       dr_threshold,
-      1.1,
       fractional_coordinates=True,
       format=format,
     )
-    direct_fn = partition.neighbor_list(
-      displacement,
-      box,
-      cutoff,
-      dr_threshold,
-      1.1,
-      fractional_coordinates=True,
-      format=format,
-      sparse_backend='direct',
+    legacy_nbrs, direct_nbrs = self._allocate_pair(
+      legacy_fn, direct_fn, R, box=runtime_box
     )
-
-    legacy_nbrs = legacy_fn.allocate(R, box=runtime_box)
-    direct_nbrs = direct_fn.allocate(R, box=runtime_box)
-    self._assert_sparse_neighbors_match(legacy_nbrs, direct_nbrs)
-
-    update = jit(lambda pos, nbrs, box: nbrs.update(pos, box=box))
-    legacy_updated = update(moved, legacy_nbrs, updated_box)
-    direct_updated = update(moved, direct_nbrs, updated_box)
-    self._assert_sparse_neighbors_match(legacy_updated, direct_updated)
+    self._update_pair(legacy_nbrs, direct_nbrs, moved, box=updated_box)
 
   @parameterized.named_parameters(
     test_util.cases_from_list(
@@ -417,27 +408,10 @@ class NeighborListTest(test_util.JAXMDTestCase):
     )
     R = runtime_box * random.uniform(key, (256, dim), dtype=dtype)
 
-    legacy_fn = partition.neighbor_list(
-      displacement,
-      box,
-      cutoff,
-      dr_threshold,
-      1.1,
-      format=format,
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
+      displacement, box, cutoff, dr_threshold, format=format
     )
-    direct_fn = partition.neighbor_list(
-      displacement,
-      box,
-      cutoff,
-      dr_threshold,
-      1.1,
-      format=format,
-      sparse_backend='direct',
-    )
-
-    legacy_nbrs = legacy_fn.allocate(R, box=runtime_box)
-    direct_nbrs = direct_fn.allocate(R, box=runtime_box)
-    self._assert_sparse_neighbors_match(legacy_nbrs, direct_nbrs)
+    self._allocate_pair(legacy_fn, direct_fn, R, box=runtime_box)
 
   @parameterized.named_parameters(
     test_util.cases_from_list(
@@ -680,33 +654,18 @@ class NeighborListTest(test_util.JAXMDTestCase):
     def custom_edge_mask(sender_idx, receiver_idx):
       return jnp.abs(sender_idx - receiver_idx) > 3
 
-    legacy_fn = partition.neighbor_list(
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
       displacement_fn,
-      box=box,
-      r_cutoff=r_cutoff,
-      dr_threshold=dr_threshold,
+      box,
+      r_cutoff,
+      dr_threshold,
       format=format,
       custom_edge_mask=custom_edge_mask,
     )
-    direct_fn = partition.neighbor_list(
-      displacement_fn,
-      box=box,
-      r_cutoff=r_cutoff,
-      dr_threshold=dr_threshold,
-      format=format,
-      custom_edge_mask=custom_edge_mask,
-      sparse_backend='direct',
-    )
-
-    legacy_nbrs = legacy_fn.allocate(R)
-    direct_nbrs = direct_fn.allocate(R)
-    self._assert_sparse_neighbors_match(legacy_nbrs, direct_nbrs)
+    legacy_nbrs, direct_nbrs = self._allocate_pair(legacy_fn, direct_fn, R)
     self.assertEqual(expected_count, int(partition.neighbor_list_mask(direct_nbrs).sum()))
 
-    update = jit(lambda pos, nbrs: nbrs.update(pos))
-    legacy_updated = update(moved, legacy_nbrs)
-    direct_updated = update(moved, direct_nbrs)
-    self._assert_sparse_neighbors_match(legacy_updated, direct_updated)
+    _, direct_updated = self._update_pair(legacy_nbrs, direct_nbrs, moved)
     self.assertEqual(
       expected_count, int(partition.neighbor_list_mask(direct_updated).sum())
     )

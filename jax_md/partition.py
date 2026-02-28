@@ -995,6 +995,51 @@ def neighbor_list(
     )
     return jnp.where(valid & edge_mask, idx, N)
 
+  def canonicalize_sparse_pair(
+    sender_idx: Array, receiver_idx: Array
+  ) -> tuple[Array, Array]:
+    if format is NeighborListFormat.OrderedSparse:
+      return jnp.maximum(sender_idx, receiver_idx), jnp.minimum(
+        sender_idx, receiver_idx
+      )
+    return sender_idx, receiver_idx
+
+  def candidate_edges_from_cell_pair(
+    position: Array,
+    ids: Array,
+    neighbor_ids: Array,
+    is_zero: bool,
+    d: Callable[..., Array],
+    safe_position: Array,
+    **kwargs,
+  ) -> tuple[Array, Array, Array]:
+    N = position.shape[0]
+
+    sender_ids = jnp.broadcast_to(ids[..., :, None], ids.shape + (ids.shape[-1],))
+    receiver_ids = jnp.broadcast_to(
+      neighbor_ids[..., None, :], ids.shape + (ids.shape[-1],)
+    )
+
+    mask = (sender_ids < N) & (receiver_ids < N)
+    if is_zero:
+      if mask_self:
+        mask = mask & (sender_ids != receiver_ids)
+      if format is NeighborListFormat.OrderedSparse:
+        mask = mask & (sender_ids < receiver_ids)
+
+    flat_sender = jnp.reshape(sender_ids, (-1,))
+    flat_receiver = jnp.reshape(receiver_ids, (-1,))
+    flat_mask = jnp.reshape(mask, (-1,))
+    edge_sender, edge_receiver = canonicalize_sparse_pair(
+      flat_sender, flat_receiver
+    )
+    flat_mask = apply_custom_edge_mask_flat(
+      edge_sender, edge_receiver, flat_mask, **kwargs
+    )
+    dist_sq = d(safe_position[flat_sender], safe_position[flat_receiver])
+    flat_mask = flat_mask & (dist_sq < cutoff_sq)
+    return edge_sender, edge_receiver, flat_mask
+
   @jit
   def prune_neighbor_list_dense(position: Array, idx: Array, **kwargs) -> Array:
     d = partial(metric_sq, **kwargs)
@@ -1046,7 +1091,6 @@ def neighbor_list(
   def raw_edge_count(position: Array, cl: CellList, **kwargs) -> Array:
     ids = jnp.squeeze(cl.id_buffer, axis=-1)
 
-    N = position.shape[0]
     dim = position.shape[1]
     raw_count = jnp.zeros((), i32)
 
@@ -1057,35 +1101,15 @@ def neighbor_list(
     )
 
     for offset, is_zero in _offsets_for_format(dim, format):
-      neigh_ids = jnp.squeeze(shift_array(cl.id_buffer, offset), axis=-1)
-
-      sender_ids = jnp.broadcast_to(ids[..., :, None], ids.shape + (ids.shape[-1],))
-      receiver_ids = jnp.broadcast_to(
-        neigh_ids[..., None, :], ids.shape + (ids.shape[-1],)
+      edge_sender, edge_receiver, flat_mask = candidate_edges_from_cell_pair(
+        position,
+        ids,
+        jnp.squeeze(shift_array(cl.id_buffer, offset), axis=-1),
+        is_zero,
+        d,
+        safe_position,
+        **kwargs,
       )
-
-      mask = (sender_ids < N) & (receiver_ids < N)
-
-      if is_zero:
-        if mask_self:
-          mask = mask & (sender_ids != receiver_ids)
-        if format is NeighborListFormat.OrderedSparse:
-          mask = mask & (sender_ids < receiver_ids)
-
-      flat_mask = jnp.reshape(mask, (-1,))
-      flat_sender = jnp.reshape(sender_ids, (-1,))
-      flat_receiver = jnp.reshape(receiver_ids, (-1,))
-      mask_sender = flat_sender
-      mask_receiver = flat_receiver
-      if format is NeighborListFormat.OrderedSparse:
-        mask_sender = jnp.maximum(flat_sender, flat_receiver)
-        mask_receiver = jnp.minimum(flat_sender, flat_receiver)
-      flat_mask = apply_custom_edge_mask_flat(
-        mask_sender, mask_receiver, flat_mask, **kwargs
-      )
-      dist_sq = d(safe_position[flat_sender], safe_position[flat_receiver])
-      flat_mask = flat_mask & (dist_sq < cutoff_sq)
-
       raw_count = raw_count + jnp.sum(flat_mask.astype(i32))
 
     return raw_count
@@ -1110,50 +1134,23 @@ def neighbor_list(
     )
 
     for offset, is_zero in _offsets_for_format(dim, format):
-      neigh_ids = jnp.squeeze(shift_array(cl.id_buffer, offset), axis=-1)
-
-      sender_ids = jnp.broadcast_to(ids[..., :, None], ids.shape + (ids.shape[-1],))
-      receiver_ids = jnp.broadcast_to(
-        neigh_ids[..., None, :], ids.shape + (ids.shape[-1],)
+      edge_sender, edge_receiver, flat_mask = candidate_edges_from_cell_pair(
+        position,
+        ids,
+        jnp.squeeze(shift_array(cl.id_buffer, offset), axis=-1),
+        is_zero,
+        d,
+        safe_position,
+        **kwargs,
       )
-
-      mask = (sender_ids < N) & (receiver_ids < N)
-
-      if is_zero:
-        if mask_self:
-          mask = mask & (sender_ids != receiver_ids)
-        if format is NeighborListFormat.OrderedSparse:
-          mask = mask & (sender_ids < receiver_ids)
-
-      flat_mask = jnp.reshape(mask, (-1,))
-      flat_sender = jnp.reshape(sender_ids, (-1,))
-      flat_receiver = jnp.reshape(receiver_ids, (-1,))
-      mask_sender = flat_sender
-      mask_receiver = flat_receiver
-      if format is NeighborListFormat.OrderedSparse:
-        mask_sender = jnp.maximum(flat_sender, flat_receiver)
-        mask_receiver = jnp.minimum(flat_sender, flat_receiver)
-      flat_mask = apply_custom_edge_mask_flat(
-        mask_sender, mask_receiver, flat_mask, **kwargs
-      )
-      dist_sq = d(safe_position[flat_sender], safe_position[flat_receiver])
-      flat_mask = flat_mask & (dist_sq < cutoff_sq)
-
       valid_count = jnp.sum(flat_mask.astype(i32))
       cumsum = jnp.cumsum(flat_mask.astype(i32))
       target = count + cumsum - 1
       in_bounds = flat_mask & (target < max_occupancy)
       write_index = jnp.where(in_bounds, target, max_occupancy)
 
-      if format is NeighborListFormat.OrderedSparse:
-        ordered_sender = jnp.maximum(flat_sender, flat_receiver)
-        ordered_receiver = jnp.minimum(flat_sender, flat_receiver)
-      else:
-        ordered_sender = flat_sender
-        ordered_receiver = flat_receiver
-
-      write_senders = jnp.where(in_bounds, ordered_sender, N)
-      write_receivers = jnp.where(in_bounds, ordered_receiver, N)
+      write_senders = jnp.where(in_bounds, edge_sender, N)
+      write_receivers = jnp.where(in_bounds, edge_receiver, N)
 
       senders = senders.at[write_index].set(write_senders)
       receivers = receivers.at[write_index].set(write_receivers)
@@ -1165,6 +1162,66 @@ def neighbor_list(
 
   raw_edge_count_jit = jit(raw_edge_count)
   sparse_edge_data_jit = jit(sparse_edge_data_from_cell_list, static_argnums=2)
+
+  def direct_sparse_count(position: Array, cl: CellList, **kwargs) -> Array:
+    if position.shape[0] >= sparse_allocation_jit_threshold:
+      return raw_edge_count_jit(position, cl, **kwargs)
+    return raw_edge_count(position, cl, **kwargs)
+
+  def direct_sparse_edges(
+    position: Array, cl: CellList, max_occupancy: int, allow_jit: bool, **kwargs
+  ) -> tuple[Array, Array]:
+    if allow_jit and position.shape[0] >= sparse_allocation_jit_threshold:
+      return sparse_edge_data_jit(position, cl, max_occupancy, **kwargs)
+    return sparse_edge_data_from_cell_list(
+      position, cl, max_occupancy, **kwargs
+    )
+
+  def direct_sparse_max_occupancy(
+    N: int, raw_count: Array, extra_capacity: int
+  ) -> int:
+    max_occupancy = int(
+      int(jax.device_get(raw_count)) * capacity_multiplier + N * extra_capacity
+    )
+    return min(
+      max_occupancy, _neighbor_list_capacity_limit(N, format, mask_self)
+    )
+
+  def build_direct_sparse_neighbor_list(
+    position: Array,
+    cl: CellList,
+    err: PartitionError,
+    cell_size: float,
+    cl_fn: Optional[CellListFns],
+    update_fn: Callable[..., NeighborList],
+    max_occupancy: Optional[int] = None,
+    extra_capacity: int = 0,
+    **kwargs,
+  ) -> NeighborList:
+    N = position.shape[0]
+    err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
+    if max_occupancy is None:
+      max_occupancy = direct_sparse_max_occupancy(
+        N, direct_sparse_count(position, cl, **kwargs), extra_capacity
+      )
+      idx, occupancy = direct_sparse_edges(
+        position, cl, max_occupancy, True, **kwargs
+      )
+    else:
+      idx, occupancy = direct_sparse_edges(
+        position, cl, max_occupancy, False, **kwargs
+      )
+    return NeighborList(
+      idx,
+      position,
+      err.update(PEC.NEIGHBOR_LIST_OVERFLOW, occupancy > max_occupancy),
+      cl.cell_capacity,
+      max_occupancy,
+      format,
+      cell_size,
+      cl_fn,
+      update_fn,
+    )  # pytype: disable=wrong-arg-count
 
   def neighbor_list_fn(
     position: Array, neighbors=None, extra_capacity: int = 0, **kwargs
@@ -1197,48 +1254,21 @@ def neighbor_list(
         cl_capacity = None
         idx = candidate_fn(position.shape)
       else:
-        err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
         cl_capacity = cl.cell_capacity
         if direct_sparse_supported():
-          if max_occupancy is None:
-            if position.shape[0] >= sparse_allocation_jit_threshold:
-              raw_count = raw_edge_count_jit(position, cl, **kwargs)
-            else:
-              raw_count = raw_edge_count(position, cl, **kwargs)
-            raw_count_int = int(jax.device_get(raw_count))
-            max_occupancy = int(
-              raw_count_int * capacity_multiplier + N * extra_capacity
-            )
-            capacity_limit = _neighbor_list_capacity_limit(
-              N, format, mask_self
-            )
-            if max_occupancy > capacity_limit:
-              max_occupancy = capacity_limit
-            if position.shape[0] >= sparse_allocation_jit_threshold:
-              idx, occupancy = sparse_edge_data_jit(
-                position, cl, max_occupancy, **kwargs
-              )
-            else:
-              idx, occupancy = sparse_edge_data_from_cell_list(
-                position, cl, max_occupancy, **kwargs
-              )
-          else:
-            idx, occupancy = sparse_edge_data_from_cell_list(
-              position, cl, max_occupancy, **kwargs
-            )
-          update_fn = neighbor_list_fn if neighbors is None else neighbors.update_fn
-          return NeighborList(
-            idx,
+          return build_direct_sparse_neighbor_list(
             position,
-            err.update(PEC.NEIGHBOR_LIST_OVERFLOW, occupancy > max_occupancy),
-            cl_capacity,
-            max_occupancy,
-            format,
+            cl,
+            err,
             cell_size,
             cl_fn,
-            update_fn,
-          )  # pytype: disable=wrong-arg-count
+            neighbor_list_fn if neighbors is None else neighbors.update_fn,
+            max_occupancy=max_occupancy,
+            extra_capacity=extra_capacity,
+            **kwargs,
+          )
 
+        err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
         idx = cell_list_candidate_fn(cl.id_buffer, position.shape)
 
       if mask_self:
@@ -1281,40 +1311,16 @@ def neighbor_list(
     if nbrs is None:
       if allocation_cl_fn is not None and 'box' not in kwargs:
         cl = allocation_cl_fn.allocate(position, extra_capacity=extra_capacity)
-        err = PartitionError(jnp.zeros((), jnp.uint8))
-        err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
-        if position.shape[0] >= sparse_allocation_jit_threshold:
-          raw_count = raw_edge_count_jit(position, cl, **kwargs)
-        else:
-          raw_count = raw_edge_count(position, cl, **kwargs)
-        raw_count_int = int(jax.device_get(raw_count))
-        max_occupancy = int(
-          raw_count_int * capacity_multiplier + position.shape[0] * extra_capacity
-        )
-        capacity_limit = _neighbor_list_capacity_limit(
-          position.shape[0], format, mask_self
-        )
-        if max_occupancy > capacity_limit:
-          max_occupancy = capacity_limit
-        if position.shape[0] >= sparse_allocation_jit_threshold:
-          idx, occupancy = sparse_edge_data_jit(
-            position, cl, max_occupancy, **kwargs
-          )
-        else:
-          idx, occupancy = sparse_edge_data_from_cell_list(
-            position, cl, max_occupancy, **kwargs
-          )
-        return NeighborList(
-          idx,
+        return build_direct_sparse_neighbor_list(
           position,
-          err.update(PEC.NEIGHBOR_LIST_OVERFLOW, occupancy > max_occupancy),
-          cl.cell_capacity,
-          max_occupancy,
-          format,
+          cl,
+          PartitionError(jnp.zeros((), jnp.uint8)),
           allocation_cell_size,
           allocation_cl_fn,
           neighbor_list_fn,
-        )  # pytype: disable=wrong-arg-count
+          extra_capacity=extra_capacity,
+          **kwargs,
+        )
 
       return neighbor_fn((position, PartitionError(jnp.zeros((), jnp.uint8))))
 
