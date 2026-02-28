@@ -15,7 +15,6 @@
 """Code to transform functions on individual tuples of particles to sets."""
 
 import inspect
-import os
 
 import jax
 from absl import logging
@@ -903,11 +902,7 @@ def neighbor_list(
     A NeighborListFns object that contains a method to allocate a new neighbor
     list and a method to update an existing neighbor list.
   """
-  sparse_backend = static_kwargs.pop('sparse_backend', None)
-  if sparse_backend is None:
-    sparse_backend = os.environ.get(
-      'JAX_MD_SPARSE_NEIGHBOR_BACKEND', 'legacy'
-    )
+  sparse_backend = static_kwargs.pop('sparse_backend', 'legacy')
   if sparse_backend not in ('legacy', 'direct'):
     raise ValueError(
       'Neighbor list sparse_backend must be one of '
