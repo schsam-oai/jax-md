@@ -188,6 +188,12 @@ class CellListTest(test_util.JAXMDTestCase):
 
 
 class NeighborListTest(test_util.JAXMDTestCase):
+  def _sorted_sparse_pairs(self, nbrs):
+    mask = partition.neighbor_list_mask(nbrs)
+    N = nbrs.reference_position.shape[0]
+    pair_id = nbrs.idx[1] * N + nbrs.idx[0]
+    return np.sort(pair_id[mask])
+
   @parameterized.named_parameters(
     test_util.cases_from_list(
       {
@@ -243,6 +249,82 @@ class NeighborListTest(test_util.JAXMDTestCase):
       dR_exact_row = np.array(dR_exact_row[dR_exact_row > 0.0], dtype)
 
       self.assertAllClose(dR_row, dR_exact_row)
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': f'_dtype={dtype.__name__}_dim={dim}_format={fmt.name}',
+        'dtype': dtype,
+        'dim': dim,
+        'format': fmt,
+      }
+      for dtype in POSITION_DTYPE
+      for dim in SPATIAL_DIMENSION
+      for fmt in [partition.Sparse, partition.OrderedSparse]
+    )
+  )
+  def test_neighbor_list_direct_sparse_backend_matches_legacy(
+    self, dtype, dim, format
+  ):
+    key = random.PRNGKey(7)
+
+    box_size = (
+      np.array([9.0, 4.0, 7.25], f32)
+      if dim == 3
+      else np.array([9.0, 4.25], f32)
+    )
+    cutoff = f32(1.23)
+    dr_threshold = f32(0.5)
+
+    displacement, _ = space.periodic(box_size)
+    R = box_size * random.uniform(key, (256, dim), dtype=dtype)
+    moved = R.at[0, 0].add(dr_threshold)
+    moved = np.mod(moved, box_size)
+
+    legacy_fn = partition.neighbor_list(
+      displacement,
+      box_size,
+      cutoff,
+      dr_threshold,
+      1.1,
+      format=format,
+    )
+    direct_fn = partition.neighbor_list(
+      displacement,
+      box_size,
+      cutoff,
+      dr_threshold,
+      1.1,
+      format=format,
+      sparse_backend='direct',
+    )
+
+    legacy_nbrs = legacy_fn.allocate(R)
+    direct_nbrs = direct_fn.allocate(R)
+
+    self.assertAllClose(
+      self._sorted_sparse_pairs(legacy_nbrs),
+      self._sorted_sparse_pairs(direct_nbrs),
+    )
+    self.assertEqual(legacy_nbrs.max_occupancy, direct_nbrs.max_occupancy)
+    self.assertEqual(
+      legacy_nbrs.did_buffer_overflow, direct_nbrs.did_buffer_overflow
+    )
+
+    update = jit(lambda pos, nbrs: nbrs.update(pos))
+    legacy_updated = update(moved, legacy_nbrs)
+    direct_updated = update(moved, direct_nbrs)
+
+    self.assertAllClose(
+      self._sorted_sparse_pairs(legacy_updated),
+      self._sorted_sparse_pairs(direct_updated),
+    )
+    self.assertEqual(
+      legacy_updated.max_occupancy, direct_updated.max_occupancy
+    )
+    self.assertEqual(
+      legacy_updated.did_buffer_overflow, direct_updated.did_buffer_overflow
+    )
 
   @parameterized.named_parameters(
     test_util.cases_from_list(
