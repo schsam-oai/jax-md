@@ -14,6 +14,7 @@
 
 """Code to transform functions on individual tuples of particles to sets."""
 
+import inspect
 import os
 
 import jax
@@ -61,8 +62,26 @@ i64 = util.i64
 Box = space.Box
 DisplacementOrMetricFn = space.DisplacementOrMetricFn
 MetricFn = space.MetricFn
-MaskFn = Callable[[Array], Array]
-EdgeMaskFn = Callable[..., Array]
+MaskFn = Callable[..., Array]
+
+
+def _mask_uses_edge_pairs(mask_fn: Optional[MaskFn]) -> bool:
+  if mask_fn is None:
+    return False
+  try:
+    signature = inspect.signature(mask_fn)
+  except (TypeError, ValueError):
+    return False
+  positional_params = [
+    parameter
+    for parameter in signature.parameters.values()
+    if parameter.kind
+    in (
+      inspect.Parameter.POSITIONAL_ONLY,
+      inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+  ]
+  return len(positional_params) >= 2
 
 
 # Cell List
@@ -803,7 +822,6 @@ def neighbor_list(
   disable_cell_list: bool = False,
   mask_self: bool = True,
   custom_mask_function: Optional[MaskFn] = None,
-  custom_edge_mask: Optional[EdgeMaskFn] = None,
   fractional_coordinates: bool = False,
   format: NeighborListFormat = NeighborListFormat.Dense,
   **static_kwargs,
@@ -868,16 +886,11 @@ def neighbor_list(
       debugging but should generally be left as `False`.
     mask_self: An optional boolean. Determines whether points can consider
       themselves to be their own neighbors.
-    custom_mask_function: An optional function. Takes the neighbor array
-      and masks selected elements. Note: The input array to the function is
-      `(n_particles, m)` where the index of particle 1 is in index in the first
-      dimension of the array, the index of particle 2 is given by the value in
-      the array
-    custom_edge_mask: An optional sparse-native masking function. It is called
-      as `custom_edge_mask(sender_idx, receiver_idx, **kwargs)` and should
-      return a boolean mask with the same shape as the sender / receiver index
-      arrays. Unlike `custom_mask_function`, this API composes naturally with
-      sparse neighbor-list construction.
+    custom_mask_function: An optional masking function. If it accepts one
+      positional argument, it is treated as the legacy dense masking API and is
+      called as `custom_mask_function(idx)`. If it accepts two positional
+      arguments, it is treated as a sparse-native masking API and is called as
+      `custom_mask_function(sender_idx, receiver_idx, **kwargs)`.
     fractional_coordinates: An optional boolean. Specifies whether positions
       will be supplied in fractional coordinates in the unit cube, :math:`[0, 1]^d`.
       If this is set to True then the `box_size` will be set to `1.0` and the
@@ -913,13 +926,14 @@ def neighbor_list(
   threshold_sq = (dr_threshold / f32(2)) ** 2
   metric_sq = _displacement_or_metric_to_metric_sq(displacement_or_metric)
   sparse_allocation_jit_threshold = 4096
+  custom_mask_uses_edges = _mask_uses_edge_pairs(custom_mask_function)
 
   def direct_sparse_supported() -> bool:
     return (
       sparse_backend == 'direct'
       and is_sparse(format)
       and not disable_cell_list
-      and custom_mask_function is None
+      and (custom_mask_function is None or custom_mask_uses_edges)
     )
 
   allocation_cell_size = None
@@ -972,18 +986,18 @@ def neighbor_list(
   def apply_custom_edge_mask_flat(
     sender_idx: Array, receiver_idx: Array, valid_mask: Array, **kwargs
   ) -> Array:
-    if custom_edge_mask is None:
+    if not custom_mask_uses_edges:
       return valid_mask
 
     safe_sender = jnp.where(valid_mask, sender_idx, 0)
     safe_receiver = jnp.where(valid_mask, receiver_idx, 0)
     edge_mask = jnp.asarray(
-      custom_edge_mask(safe_sender, safe_receiver, **kwargs), dtype=bool
+      custom_mask_function(safe_sender, safe_receiver, **kwargs), dtype=bool
     )
     return valid_mask & edge_mask
 
   def apply_custom_edge_mask_dense(idx: Array, **kwargs) -> Array:
-    if custom_edge_mask is None:
+    if not custom_mask_uses_edges:
       return idx
 
     N = idx.shape[0]
@@ -991,7 +1005,7 @@ def neighbor_list(
     valid = idx < N
     safe_receiver = jnp.where(valid, idx, 0)
     edge_mask = jnp.asarray(
-      custom_edge_mask(sender_idx, safe_receiver, **kwargs), dtype=bool
+      custom_mask_function(sender_idx, safe_receiver, **kwargs), dtype=bool
     )
     return jnp.where(valid & edge_mask, idx, N)
 
@@ -1274,9 +1288,10 @@ def neighbor_list(
       if mask_self:
         idx = mask_self_fn(idx)
       if custom_mask_function is not None:
-        idx = custom_mask_function(idx)
-      if custom_edge_mask is not None:
-        idx = apply_custom_edge_mask_dense(idx, **kwargs)
+        if custom_mask_uses_edges:
+          idx = apply_custom_edge_mask_dense(idx, **kwargs)
+        else:
+          idx = custom_mask_function(idx)
 
       if is_sparse(format):
         idx, occupancy = prune_neighbor_list_sparse(position, idx, **kwargs)

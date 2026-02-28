@@ -639,7 +639,7 @@ class NeighborListTest(test_util.JAXMDTestCase):
       ]
     )
   )
-  def test_custom_edge_mask_matches_legacy_and_direct(
+  def test_sparse_custom_mask_function_matches_legacy_and_direct(
     self, format, expected_count
   ):
     displacement_fn, _ = space.free()
@@ -651,7 +651,7 @@ class NeighborListTest(test_util.JAXMDTestCase):
     R = jnp.broadcast_to(jnp.zeros(3), (n_particles, 3))
     moved = R.at[0, 0].set(0.1)
 
-    def custom_edge_mask(sender_idx, receiver_idx):
+    def custom_mask_function(sender_idx, receiver_idx):
       return jnp.abs(sender_idx - receiver_idx) > 3
 
     legacy_fn, direct_fn = self._neighbor_fn_pair(
@@ -660,7 +660,7 @@ class NeighborListTest(test_util.JAXMDTestCase):
       r_cutoff,
       dr_threshold,
       format=format,
-      custom_edge_mask=custom_edge_mask,
+      custom_mask_function=custom_mask_function,
     )
     legacy_nbrs, direct_nbrs = self._allocate_pair(legacy_fn, direct_fn, R)
     self.assertEqual(expected_count, int(partition.neighbor_list_mask(direct_nbrs).sum()))

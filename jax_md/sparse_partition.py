@@ -16,7 +16,6 @@ Array = partition.Array
 Box = partition.Box
 DisplacementOrMetricFn = partition.DisplacementOrMetricFn
 MaskFn = partition.MaskFn
-EdgeMaskFn = partition.EdgeMaskFn
 NeighborListFns = partition.NeighborListFns
 NeighborListFormat = partition.NeighborListFormat
 
@@ -30,7 +29,6 @@ def neighbor_list(
   disable_cell_list: bool = False,
   mask_self: bool = True,
   custom_mask_function: Optional[MaskFn] = None,
-  custom_edge_mask: Optional[EdgeMaskFn] = None,
   fractional_coordinates: bool = False,
   format: NeighborListFormat = NeighborListFormat.Dense,
   **static_kwargs,
@@ -45,7 +43,6 @@ def neighbor_list(
     disable_cell_list=disable_cell_list,
     mask_self=mask_self,
     custom_mask_function=custom_mask_function,
-    custom_edge_mask=custom_edge_mask,
     fractional_coordinates=fractional_coordinates,
     format=format,
     **static_kwargs,
