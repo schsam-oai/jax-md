@@ -62,6 +62,7 @@ Box = space.Box
 DisplacementOrMetricFn = space.DisplacementOrMetricFn
 MetricFn = space.MetricFn
 MaskFn = Callable[[Array], Array]
+EdgeMaskFn = Callable[..., Array]
 
 
 # Cell List
@@ -802,6 +803,7 @@ def neighbor_list(
   disable_cell_list: bool = False,
   mask_self: bool = True,
   custom_mask_function: Optional[MaskFn] = None,
+  custom_edge_mask: Optional[EdgeMaskFn] = None,
   fractional_coordinates: bool = False,
   format: NeighborListFormat = NeighborListFormat.Dense,
   **static_kwargs,
@@ -871,6 +873,11 @@ def neighbor_list(
       `(n_particles, m)` where the index of particle 1 is in index in the first
       dimension of the array, the index of particle 2 is given by the value in
       the array
+    custom_edge_mask: An optional sparse-native masking function. It is called
+      as `custom_edge_mask(sender_idx, receiver_idx, **kwargs)` and should
+      return a boolean mask with the same shape as the sender / receiver index
+      arrays. Unlike `custom_mask_function`, this API composes naturally with
+      sparse neighbor-list construction.
     fractional_coordinates: An optional boolean. Specifies whether positions
       will be supplied in fractional coordinates in the unit cube, :math:`[0, 1]^d`.
       If this is set to True then the `box_size` will be set to `1.0` and the
@@ -962,6 +969,32 @@ def neighbor_list(
     )
     return jnp.where(self_mask, idx.shape[0], idx)
 
+  def apply_custom_edge_mask_flat(
+    sender_idx: Array, receiver_idx: Array, valid_mask: Array, **kwargs
+  ) -> Array:
+    if custom_edge_mask is None:
+      return valid_mask
+
+    safe_sender = jnp.where(valid_mask, sender_idx, 0)
+    safe_receiver = jnp.where(valid_mask, receiver_idx, 0)
+    edge_mask = jnp.asarray(
+      custom_edge_mask(safe_sender, safe_receiver, **kwargs), dtype=bool
+    )
+    return valid_mask & edge_mask
+
+  def apply_custom_edge_mask_dense(idx: Array, **kwargs) -> Array:
+    if custom_edge_mask is None:
+      return idx
+
+    N = idx.shape[0]
+    sender_idx = jnp.broadcast_to(jnp.arange(N, dtype=i32)[:, None], idx.shape)
+    valid = idx < N
+    safe_receiver = jnp.where(valid, idx, 0)
+    edge_mask = jnp.asarray(
+      custom_edge_mask(sender_idx, safe_receiver, **kwargs), dtype=bool
+    )
+    return jnp.where(valid & edge_mask, idx, N)
+
   @jit
   def prune_neighbor_list_dense(position: Array, idx: Array, **kwargs) -> Array:
     d = partial(metric_sq, **kwargs)
@@ -1042,6 +1075,14 @@ def neighbor_list(
       flat_mask = jnp.reshape(mask, (-1,))
       flat_sender = jnp.reshape(sender_ids, (-1,))
       flat_receiver = jnp.reshape(receiver_ids, (-1,))
+      mask_sender = flat_sender
+      mask_receiver = flat_receiver
+      if format is NeighborListFormat.OrderedSparse:
+        mask_sender = jnp.maximum(flat_sender, flat_receiver)
+        mask_receiver = jnp.minimum(flat_sender, flat_receiver)
+      flat_mask = apply_custom_edge_mask_flat(
+        mask_sender, mask_receiver, flat_mask, **kwargs
+      )
       dist_sq = d(safe_position[flat_sender], safe_position[flat_receiver])
       flat_mask = flat_mask & (dist_sq < cutoff_sq)
 
@@ -1087,6 +1128,14 @@ def neighbor_list(
       flat_mask = jnp.reshape(mask, (-1,))
       flat_sender = jnp.reshape(sender_ids, (-1,))
       flat_receiver = jnp.reshape(receiver_ids, (-1,))
+      mask_sender = flat_sender
+      mask_receiver = flat_receiver
+      if format is NeighborListFormat.OrderedSparse:
+        mask_sender = jnp.maximum(flat_sender, flat_receiver)
+        mask_receiver = jnp.minimum(flat_sender, flat_receiver)
+      flat_mask = apply_custom_edge_mask_flat(
+        mask_sender, mask_receiver, flat_mask, **kwargs
+      )
       dist_sq = d(safe_position[flat_sender], safe_position[flat_receiver])
       flat_mask = flat_mask & (dist_sq < cutoff_sq)
 
@@ -1196,6 +1245,8 @@ def neighbor_list(
         idx = mask_self_fn(idx)
       if custom_mask_function is not None:
         idx = custom_mask_function(idx)
+      if custom_edge_mask is not None:
+        idx = apply_custom_edge_mask_dense(idx, **kwargs)
 
       if is_sparse(format):
         idx, occupancy = prune_neighbor_list_sparse(position, idx, **kwargs)

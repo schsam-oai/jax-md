@@ -652,6 +652,65 @@ class NeighborListTest(test_util.JAXMDTestCase):
     """
     self.assertEqual(42, (neighbors.idx != mask_val).sum())
 
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': f'_format={fmt.name}',
+        'format': fmt,
+        'expected_count': expected_count,
+      }
+      for fmt, expected_count in [
+        (partition.Sparse, 42),
+        (partition.OrderedSparse, 21),
+      ]
+    )
+  )
+  def test_custom_edge_mask_matches_legacy_and_direct(
+    self, format, expected_count
+  ):
+    displacement_fn, _ = space.free()
+
+    box = 1.0
+    r_cutoff = 3.0
+    dr_threshold = 0.05
+    n_particles = 10
+    R = jnp.broadcast_to(jnp.zeros(3), (n_particles, 3))
+    moved = R.at[0, 0].set(0.1)
+
+    def custom_edge_mask(sender_idx, receiver_idx):
+      return jnp.abs(sender_idx - receiver_idx) > 3
+
+    legacy_fn = partition.neighbor_list(
+      displacement_fn,
+      box=box,
+      r_cutoff=r_cutoff,
+      dr_threshold=dr_threshold,
+      format=format,
+      custom_edge_mask=custom_edge_mask,
+    )
+    direct_fn = partition.neighbor_list(
+      displacement_fn,
+      box=box,
+      r_cutoff=r_cutoff,
+      dr_threshold=dr_threshold,
+      format=format,
+      custom_edge_mask=custom_edge_mask,
+      sparse_backend='direct',
+    )
+
+    legacy_nbrs = legacy_fn.allocate(R)
+    direct_nbrs = direct_fn.allocate(R)
+    self._assert_sparse_neighbors_match(legacy_nbrs, direct_nbrs)
+    self.assertEqual(expected_count, int(partition.neighbor_list_mask(direct_nbrs).sum()))
+
+    update = jit(lambda pos, nbrs: nbrs.update(pos))
+    legacy_updated = update(moved, legacy_nbrs)
+    direct_updated = update(moved, direct_nbrs)
+    self._assert_sparse_neighbors_match(legacy_updated, direct_updated)
+    self.assertEqual(
+      expected_count, int(partition.neighbor_list_mask(direct_updated).sum())
+    )
+
   def test_issue191_1(self):
     box_vector = jnp.ones(3) * 3
 
