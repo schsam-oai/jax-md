@@ -14,6 +14,8 @@
 
 """Code to transform functions on individual tuples of particles to sets."""
 
+import inspect
+
 import jax
 from absl import logging
 
@@ -59,7 +61,26 @@ i64 = util.i64
 Box = space.Box
 DisplacementOrMetricFn = space.DisplacementOrMetricFn
 MetricFn = space.MetricFn
-MaskFn = Callable[[Array], Array]
+MaskFn = Callable[..., Array]
+
+
+def _mask_uses_edge_pairs(mask_fn: Optional[MaskFn]) -> bool:
+  if mask_fn is None:
+    return False
+  try:
+    signature = inspect.signature(mask_fn)
+  except (TypeError, ValueError):
+    return False
+  positional_params = [
+    parameter
+    for parameter in signature.parameters.values()
+    if parameter.kind
+    in (
+      inspect.Parameter.POSITIONAL_ONLY,
+      inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+  ]
+  return len(positional_params) >= 2
 
 
 # Cell List
@@ -246,6 +267,37 @@ def shift_array(arr: Array, dindex: Array) -> Array:
     arr = jnp.concatenate((arr[:, :, -1:], arr[:, :, :-1]), axis=2)
 
   return arr
+
+
+def _is_canonical_offset(offset: onp.ndarray) -> bool:
+  for value in offset:
+    if value != 0:
+      return bool(value > 0)
+  return True
+
+
+def _offsets_for_format(
+  dimension: int, fmt: 'NeighborListFormat'
+) -> list[tuple[onp.ndarray, bool]]:
+  offsets = []
+  for offset in _neighboring_cells(dimension):
+    is_zero = bool(onp.all(offset == 0))
+    if fmt is NeighborListFormat.OrderedSparse:
+      if is_zero or _is_canonical_offset(offset):
+        offsets.append((offset, is_zero))
+    else:
+      offsets.append((offset, is_zero))
+  return offsets
+
+
+def _neighbor_list_capacity_limit(
+  N: int, fmt: 'NeighborListFormat', mask_self: bool
+) -> int:
+  if not is_sparse(fmt):
+    return N - 1 if mask_self else N
+  if fmt is NeighborListFormat.Sparse:
+    return N * (N - 1) if mask_self else N**2
+  return N * (N - 1) // 2
 
 
 def unflatten_cell_buffer(arr: Array, cells_per_side: Array, dim: int) -> Array:
@@ -771,6 +823,7 @@ def neighbor_list(
   custom_mask_function: Optional[MaskFn] = None,
   fractional_coordinates: bool = False,
   format: NeighborListFormat = NeighborListFormat.Dense,
+  use_experimental_sparse_neighbor_list: bool = False,
   **static_kwargs,
 ) -> NeighborFn:
   """Returns a function that builds a list neighbors for collections of points.
@@ -833,17 +886,20 @@ def neighbor_list(
       debugging but should generally be left as `False`.
     mask_self: An optional boolean. Determines whether points can consider
       themselves to be their own neighbors.
-    custom_mask_function: An optional function. Takes the neighbor array
-      and masks selected elements. Note: The input array to the function is
-      `(n_particles, m)` where the index of particle 1 is in index in the first
-      dimension of the array, the index of particle 2 is given by the value in
-      the array
+    custom_mask_function: An optional masking function. If it accepts one
+      positional argument, it is treated as the legacy dense masking API and is
+      called as `custom_mask_function(idx)`. If it accepts two positional
+      arguments, it is treated as a sparse-native masking API and is called as
+      `custom_mask_function(sender_idx, receiver_idx, **kwargs)`.
     fractional_coordinates: An optional boolean. Specifies whether positions
       will be supplied in fractional coordinates in the unit cube, :math:`[0, 1]^d`.
       If this is set to True then the `box_size` will be set to `1.0` and the
       cell size used in the cell list will be set to `cutoff / box_size`.
     format: The format of the neighbor list; see the :meth:`NeighborListFormat` enum
       for details about the different choices for formats. Defaults to `Dense`.
+    use_experimental_sparse_neighbor_list: Enables the direct sparse
+      neighbor-list path for supported sparse cases. When `False`, sparse
+      neighbor lists use the legacy candidate-materialization path.
     **static_kwargs: kwargs that get threaded through the calculation of
       example positions.
   Returns:
@@ -861,6 +917,28 @@ def neighbor_list(
   cutoff_sq = cutoff**2
   threshold_sq = (dr_threshold / f32(2)) ** 2
   metric_sq = _displacement_or_metric_to_metric_sq(displacement_or_metric)
+  # Allocation is usually a cold or infrequent Python path. Always jitting
+  # these helpers makes repeated same-shape allocation much faster for large
+  # systems, but it also adds a large compile penalty that dominates smaller or
+  # one-off allocations. Keep a size threshold so we only pay that compile cost
+  # when it is likely to amortize.
+  sparse_allocation_jit_threshold = 4096
+  custom_mask_uses_edges = _mask_uses_edge_pairs(custom_mask_function)
+
+  def direct_sparse_supported() -> bool:
+    return (
+      use_experimental_sparse_neighbor_list
+      and is_sparse(format)
+      and not disable_cell_list
+      and (custom_mask_function is None or custom_mask_uses_edges)
+    )
+
+  allocation_cell_size = None
+  allocation_cl_fn = None
+  if direct_sparse_supported() and not fractional_coordinates:
+    allocation_cell_size = cutoff
+    if bool(jax.device_get(jnp.all(allocation_cell_size < box / 3.0))):
+      allocation_cl_fn = cell_list(box, allocation_cell_size, capacity_multiplier)
 
   @partial(jit, static_argnums=0)
   def candidate_fn(positionShape) -> Array:
@@ -901,6 +979,77 @@ def neighbor_list(
       jnp.arange(idx.shape[0], dtype=i32), (idx.shape[0], 1)
     )
     return jnp.where(self_mask, idx.shape[0], idx)
+
+  def apply_custom_edge_mask_flat(
+    sender_idx: Array, receiver_idx: Array, valid_mask: Array, **kwargs
+  ) -> Array:
+    if not custom_mask_uses_edges:
+      return valid_mask
+
+    safe_sender = jnp.where(valid_mask, sender_idx, 0)
+    safe_receiver = jnp.where(valid_mask, receiver_idx, 0)
+    edge_mask = jnp.asarray(
+      custom_mask_function(safe_sender, safe_receiver, **kwargs), dtype=bool
+    )
+    return valid_mask & edge_mask
+
+  def apply_custom_edge_mask_dense(idx: Array, **kwargs) -> Array:
+    if not custom_mask_uses_edges:
+      return idx
+
+    N = idx.shape[0]
+    sender_idx = jnp.broadcast_to(jnp.arange(N, dtype=i32)[:, None], idx.shape)
+    valid = idx < N
+    safe_receiver = jnp.where(valid, idx, 0)
+    edge_mask = jnp.asarray(
+      custom_mask_function(sender_idx, safe_receiver, **kwargs), dtype=bool
+    )
+    return jnp.where(valid & edge_mask, idx, N)
+
+  def canonicalize_sparse_pair(
+    sender_idx: Array, receiver_idx: Array
+  ) -> tuple[Array, Array]:
+    if format is NeighborListFormat.OrderedSparse:
+      return jnp.maximum(sender_idx, receiver_idx), jnp.minimum(
+        sender_idx, receiver_idx
+      )
+    return sender_idx, receiver_idx
+
+  def candidate_edges_from_cell_pair(
+    position: Array,
+    ids: Array,
+    neighbor_ids: Array,
+    is_zero: bool,
+    d: Callable[..., Array],
+    safe_position: Array,
+    **kwargs,
+  ) -> tuple[Array, Array, Array]:
+    N = position.shape[0]
+
+    sender_ids = jnp.broadcast_to(ids[..., :, None], ids.shape + (ids.shape[-1],))
+    receiver_ids = jnp.broadcast_to(
+      neighbor_ids[..., None, :], ids.shape + (ids.shape[-1],)
+    )
+
+    mask = (sender_ids < N) & (receiver_ids < N)
+    if is_zero:
+      if mask_self:
+        mask = mask & (sender_ids != receiver_ids)
+      if format is NeighborListFormat.OrderedSparse:
+        mask = mask & (sender_ids < receiver_ids)
+
+    flat_sender = jnp.reshape(sender_ids, (-1,))
+    flat_receiver = jnp.reshape(receiver_ids, (-1,))
+    flat_mask = jnp.reshape(mask, (-1,))
+    edge_sender, edge_receiver = canonicalize_sparse_pair(
+      flat_sender, flat_receiver
+    )
+    flat_mask = apply_custom_edge_mask_flat(
+      edge_sender, edge_receiver, flat_mask, **kwargs
+    )
+    dist_sq = d(safe_position[flat_sender], safe_position[flat_receiver])
+    flat_mask = flat_mask & (dist_sq < cutoff_sq)
+    return edge_sender, edge_receiver, flat_mask
 
   @jit
   def prune_neighbor_list_dense(position: Array, idx: Array, **kwargs) -> Array:
@@ -950,6 +1099,139 @@ def neighbor_list(
 
     return jnp.stack((receiver_idx, sender_idx)), max_occupancy
 
+  def raw_edge_count(position: Array, cl: CellList, **kwargs) -> Array:
+    ids = jnp.squeeze(cl.id_buffer, axis=-1)
+
+    dim = position.shape[1]
+    raw_count = jnp.zeros((), i32)
+
+    d = partial(metric_sq, **kwargs)
+    d = space.map_bond(d)
+    safe_position = jnp.concatenate(
+      [position, jnp.zeros((1, dim), dtype=position.dtype)], axis=0
+    )
+
+    for offset, is_zero in _offsets_for_format(dim, format):
+      edge_sender, edge_receiver, flat_mask = candidate_edges_from_cell_pair(
+        position,
+        ids,
+        jnp.squeeze(shift_array(cl.id_buffer, offset), axis=-1),
+        is_zero,
+        d,
+        safe_position,
+        **kwargs,
+      )
+      raw_count = raw_count + jnp.sum(flat_mask.astype(i32))
+
+    return raw_count
+
+  def sparse_edge_data_from_cell_list(
+    position: Array, cl: CellList, max_occupancy: int, **kwargs
+  ) -> tuple[Array, Array]:
+    ids = jnp.squeeze(cl.id_buffer, axis=-1)
+
+    N = position.shape[0]
+    dim = position.shape[1]
+
+    receivers = N * jnp.ones((max_occupancy + 1,), i32)
+    senders = N * jnp.ones((max_occupancy + 1,), i32)
+    count = jnp.zeros((), i32)
+    raw_count = jnp.zeros((), i32)
+
+    d = partial(metric_sq, **kwargs)
+    d = space.map_bond(d)
+    safe_position = jnp.concatenate(
+      [position, jnp.zeros((1, dim), dtype=position.dtype)], axis=0
+    )
+
+    for offset, is_zero in _offsets_for_format(dim, format):
+      edge_sender, edge_receiver, flat_mask = candidate_edges_from_cell_pair(
+        position,
+        ids,
+        jnp.squeeze(shift_array(cl.id_buffer, offset), axis=-1),
+        is_zero,
+        d,
+        safe_position,
+        **kwargs,
+      )
+      valid_count = jnp.sum(flat_mask.astype(i32))
+      cumsum = jnp.cumsum(flat_mask.astype(i32))
+      target = count + cumsum - 1
+      in_bounds = flat_mask & (target < max_occupancy)
+      write_index = jnp.where(in_bounds, target, max_occupancy)
+
+      write_senders = jnp.where(in_bounds, edge_sender, N)
+      write_receivers = jnp.where(in_bounds, edge_receiver, N)
+
+      senders = senders.at[write_index].set(write_senders)
+      receivers = receivers.at[write_index].set(write_receivers)
+
+      count = jnp.minimum(count + valid_count, max_occupancy)
+      raw_count = raw_count + valid_count
+
+    return jnp.stack((receivers[:-1], senders[:-1])), raw_count
+
+  raw_edge_count_jit = jit(raw_edge_count)
+  sparse_edge_data_jit = jit(sparse_edge_data_from_cell_list, static_argnums=2)
+
+  def direct_sparse_count(position: Array, cl: CellList, **kwargs) -> Array:
+    if position.shape[0] >= sparse_allocation_jit_threshold:
+      return raw_edge_count_jit(position, cl, **kwargs)
+    return raw_edge_count(position, cl, **kwargs)
+
+  def direct_sparse_edges(
+    position: Array, cl: CellList, max_occupancy: int, allow_jit: bool, **kwargs
+  ) -> tuple[Array, Array]:
+    if allow_jit and position.shape[0] >= sparse_allocation_jit_threshold:
+      return sparse_edge_data_jit(position, cl, max_occupancy, **kwargs)
+    return sparse_edge_data_from_cell_list(
+      position, cl, max_occupancy, **kwargs
+    )
+
+  def direct_sparse_max_occupancy(
+    N: int, raw_count: Array, extra_capacity: int
+  ) -> int:
+    max_occupancy = int(int(raw_count) * capacity_multiplier + N * extra_capacity)
+    return min(
+      max_occupancy, _neighbor_list_capacity_limit(N, format, mask_self)
+    )
+
+  def build_direct_sparse_neighbor_list(
+    position: Array,
+    cl: CellList,
+    err: PartitionError,
+    cell_size: float,
+    cl_fn: Optional[CellListFns],
+    update_fn: Callable[..., NeighborList],
+    max_occupancy: Optional[int] = None,
+    extra_capacity: int = 0,
+    **kwargs,
+  ) -> NeighborList:
+    N = position.shape[0]
+    err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
+    if max_occupancy is None:
+      max_occupancy = direct_sparse_max_occupancy(
+        N, direct_sparse_count(position, cl, **kwargs), extra_capacity
+      )
+      idx, occupancy = direct_sparse_edges(
+        position, cl, max_occupancy, True, **kwargs
+      )
+    else:
+      idx, occupancy = direct_sparse_edges(
+        position, cl, max_occupancy, False, **kwargs
+      )
+    return NeighborList(
+      idx,
+      position,
+      err.update(PEC.NEIGHBOR_LIST_OVERFLOW, occupancy > max_occupancy),
+      cl.cell_capacity,
+      max_occupancy,
+      format,
+      cell_size,
+      cl_fn,
+      update_fn,
+    )  # pytype: disable=wrong-arg-count
+
   def neighbor_list_fn(
     position: Array, neighbors=None, extra_capacity: int = 0, **kwargs
   ) -> NeighborList:
@@ -981,14 +1263,30 @@ def neighbor_list(
         cl_capacity = None
         idx = candidate_fn(position.shape)
       else:
+        cl_capacity = cl.cell_capacity
+        if direct_sparse_supported():
+          return build_direct_sparse_neighbor_list(
+            position,
+            cl,
+            err,
+            cell_size,
+            cl_fn,
+            neighbor_list_fn if neighbors is None else neighbors.update_fn,
+            max_occupancy=max_occupancy,
+            extra_capacity=extra_capacity,
+            **kwargs,
+          )
+
         err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
         idx = cell_list_candidate_fn(cl.id_buffer, position.shape)
-        cl_capacity = cl.cell_capacity
 
       if mask_self:
         idx = mask_self_fn(idx)
       if custom_mask_function is not None:
-        idx = custom_mask_function(idx)
+        if custom_mask_uses_edges:
+          idx = apply_custom_edge_mask_dense(idx, **kwargs)
+        else:
+          idx = custom_mask_function(idx)
 
       if is_sparse(format):
         idx, occupancy = prune_neighbor_list_sparse(position, idx, **kwargs)
@@ -1002,12 +1300,7 @@ def neighbor_list(
         max_occupancy = int(occupancy * capacity_multiplier + _extra_capacity)
         if max_occupancy > idx.shape[-1]:
           max_occupancy = idx.shape[-1]
-        if not is_sparse(format):
-          capacity_limit = N - 1 if mask_self else N
-        elif format is NeighborListFormat.Sparse:
-          capacity_limit = N * (N - 1) if mask_self else N**2
-        else:
-          capacity_limit = N * (N - 1) // 2
+        capacity_limit = _neighbor_list_capacity_limit(N, format, mask_self)
         if max_occupancy > capacity_limit:
           max_occupancy = capacity_limit
       idx = idx[:, :max_occupancy]
@@ -1026,6 +1319,19 @@ def neighbor_list(
 
     nbrs = neighbors
     if nbrs is None:
+      if allocation_cl_fn is not None and 'box' not in kwargs:
+        cl = allocation_cl_fn.allocate(position, extra_capacity=extra_capacity)
+        return build_direct_sparse_neighbor_list(
+          position,
+          cl,
+          PartitionError(jnp.zeros((), jnp.uint8)),
+          allocation_cell_size,
+          allocation_cl_fn,
+          neighbor_list_fn,
+          extra_capacity=extra_capacity,
+          **kwargs,
+        )
+
       return neighbor_fn((position, PartitionError(jnp.zeros((), jnp.uint8))))
 
     neighbor_fn = partial(neighbor_fn, max_occupancy=nbrs.max_occupancy)
