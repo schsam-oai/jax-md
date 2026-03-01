@@ -188,6 +188,53 @@ class CellListTest(test_util.JAXMDTestCase):
 
 
 class NeighborListTest(test_util.JAXMDTestCase):
+  def _sorted_sparse_pairs(self, nbrs):
+    mask = partition.neighbor_list_mask(nbrs)
+    N = nbrs.reference_position.shape[0]
+    pair_id = nbrs.idx[1] * N + nbrs.idx[0]
+    return np.sort(pair_id[mask])
+
+  def _assert_sparse_neighbors_match(self, legacy_nbrs, direct_nbrs):
+    self.assertAllClose(
+      self._sorted_sparse_pairs(legacy_nbrs),
+      self._sorted_sparse_pairs(direct_nbrs),
+    )
+    self.assertEqual(legacy_nbrs.max_occupancy, direct_nbrs.max_occupancy)
+    self.assertEqual(
+      int(jax.device_get(legacy_nbrs.error.code)),
+      int(jax.device_get(direct_nbrs.error.code)),
+    )
+
+  def _neighbor_fn_pair(
+    self, displacement, box, cutoff, dr_threshold, **kwargs
+  ):
+    legacy_fn = partition.neighbor_list(
+      displacement, box, cutoff, dr_threshold, 1.1, **kwargs
+    )
+    direct_fn = partition.neighbor_list(
+      displacement,
+      box,
+      cutoff,
+      dr_threshold,
+      1.1,
+      use_experimental_sparse_neighbor_list=True,
+      **kwargs,
+    )
+    return legacy_fn, direct_fn
+
+  def _allocate_pair(self, legacy_fn, direct_fn, position, **kwargs):
+    legacy_nbrs = legacy_fn.allocate(position, **kwargs)
+    direct_nbrs = direct_fn.allocate(position, **kwargs)
+    self._assert_sparse_neighbors_match(legacy_nbrs, direct_nbrs)
+    return legacy_nbrs, direct_nbrs
+
+  def _update_pair(self, legacy_nbrs, direct_nbrs, position, **kwargs):
+    update = jit(lambda pos, nbrs: nbrs.update(pos, **kwargs))
+    legacy_updated = update(position, legacy_nbrs)
+    direct_updated = update(position, direct_nbrs)
+    self._assert_sparse_neighbors_match(legacy_updated, direct_updated)
+    return legacy_updated, direct_updated
+
   @parameterized.named_parameters(
     test_util.cases_from_list(
       {
@@ -243,6 +290,128 @@ class NeighborListTest(test_util.JAXMDTestCase):
       dR_exact_row = np.array(dR_exact_row[dR_exact_row > 0.0], dtype)
 
       self.assertAllClose(dR_row, dR_exact_row)
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': f'_dtype={dtype.__name__}_dim={dim}_format={fmt.name}',
+        'dtype': dtype,
+        'dim': dim,
+        'format': fmt,
+      }
+      for dtype in POSITION_DTYPE
+      for dim in SPATIAL_DIMENSION
+      for fmt in [partition.Sparse, partition.OrderedSparse]
+    )
+  )
+  def test_neighbor_list_experimental_sparse_neighbor_list_matches_legacy(
+    self, dtype, dim, format
+  ):
+    key = random.PRNGKey(7)
+
+    box_size = (
+      np.array([9.0, 4.0, 7.25], f32)
+      if dim == 3
+      else np.array([9.0, 4.25], f32)
+    )
+    cutoff = f32(1.23)
+    dr_threshold = f32(0.5)
+
+    displacement, _ = space.periodic(box_size)
+    R = box_size * random.uniform(key, (256, dim), dtype=dtype)
+    moved = R.at[0, 0].add(dr_threshold)
+    moved = np.mod(moved, box_size)
+
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
+      displacement, box_size, cutoff, dr_threshold, format=format
+    )
+    legacy_nbrs, direct_nbrs = self._allocate_pair(legacy_fn, direct_fn, R)
+    self._update_pair(legacy_nbrs, direct_nbrs, moved)
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': f'_fractional_box_dtype={dtype.__name__}_dim={dim}_format={fmt.name}',
+        'dtype': dtype,
+        'dim': dim,
+        'format': fmt,
+      }
+      for dtype in POSITION_DTYPE
+      for dim in SPATIAL_DIMENSION
+      for fmt in [partition.Sparse, partition.OrderedSparse]
+    )
+  )
+  def test_neighbor_list_experimental_sparse_neighbor_list_matches_legacy_fractional_box(
+    self, dtype, dim, format
+  ):
+    key = random.PRNGKey(11)
+
+    if dim == 3:
+      box = np.array(
+        [[9.0, 0.35, 0.15], [0.0, 4.0, 0.25], [0.0, 0.0, 7.25]], dtype
+      )
+    else:
+      box = np.array([[9.0, 0.35], [0.0, 4.25]], dtype)
+
+    cutoff = f32(1.23)
+    dr_threshold = f32(0.2)
+    runtime_box = box * dtype(1.1)
+    updated_box = box * dtype(1.5)
+
+    displacement, _ = space.periodic_general(box)
+    R = random.uniform(key, (256, dim), dtype=dtype)
+    moved = R.at[0, 0].add(dtype(0.2))
+    moved = np.mod(moved, dtype(1.0))
+
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
+      displacement,
+      box,
+      cutoff,
+      dr_threshold,
+      fractional_coordinates=True,
+      format=format,
+    )
+    legacy_nbrs, direct_nbrs = self._allocate_pair(
+      legacy_fn, direct_fn, R, box=runtime_box
+    )
+    self._update_pair(legacy_nbrs, direct_nbrs, moved, box=updated_box)
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': f'_runtime_box_dtype={dtype.__name__}_dim={dim}_format={fmt.name}',
+        'dtype': dtype,
+        'dim': dim,
+        'format': fmt,
+      }
+      for dtype in POSITION_DTYPE
+      for dim in SPATIAL_DIMENSION
+      for fmt in [partition.Sparse, partition.OrderedSparse]
+    )
+  )
+  def test_neighbor_list_experimental_sparse_neighbor_list_matches_legacy_runtime_box(
+    self, dtype, dim, format
+  ):
+    key = random.PRNGKey(13)
+
+    box = (
+      np.array([9.0, 4.0, 7.25], dtype)
+      if dim == 3
+      else np.array([9.0, 4.25], dtype)
+    )
+    cutoff = f32(1.23)
+    dr_threshold = f32(0.2)
+    runtime_box = box * dtype(1.1)
+
+    displacement, _ = space.periodic_general(
+      box, fractional_coordinates=False
+    )
+    R = runtime_box * random.uniform(key, (256, dim), dtype=dtype)
+
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
+      displacement, box, cutoff, dr_threshold, format=format
+    )
+    self._allocate_pair(legacy_fn, direct_fn, R, box=runtime_box)
 
   @parameterized.named_parameters(
     test_util.cases_from_list(
@@ -456,6 +625,50 @@ class NeighborListTest(test_util.JAXMDTestCase):
     With masking -> 42.
     """
     self.assertEqual(42, (neighbors.idx != mask_val).sum())
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': f'_format={fmt.name}',
+        'format': fmt,
+        'expected_count': expected_count,
+      }
+      for fmt, expected_count in [
+        (partition.Sparse, 42),
+        (partition.OrderedSparse, 21),
+      ]
+    )
+  )
+  def test_sparse_custom_mask_function_matches_legacy_and_direct(
+    self, format, expected_count
+  ):
+    displacement_fn, _ = space.free()
+
+    box = 1.0
+    r_cutoff = 3.0
+    dr_threshold = 0.05
+    n_particles = 10
+    R = jnp.broadcast_to(jnp.zeros(3), (n_particles, 3))
+    moved = R.at[0, 0].set(0.1)
+
+    def custom_mask_function(sender_idx, receiver_idx):
+      return jnp.abs(sender_idx - receiver_idx) > 3
+
+    legacy_fn, direct_fn = self._neighbor_fn_pair(
+      displacement_fn,
+      box,
+      r_cutoff,
+      dr_threshold,
+      format=format,
+      custom_mask_function=custom_mask_function,
+    )
+    legacy_nbrs, direct_nbrs = self._allocate_pair(legacy_fn, direct_fn, R)
+    self.assertEqual(expected_count, int(partition.neighbor_list_mask(direct_nbrs).sum()))
+
+    _, direct_updated = self._update_pair(legacy_nbrs, direct_nbrs, moved)
+    self.assertEqual(
+      expected_count, int(partition.neighbor_list_mask(direct_updated).sum())
+    )
 
   def test_issue191_1(self):
     box_vector = jnp.ones(3) * 3

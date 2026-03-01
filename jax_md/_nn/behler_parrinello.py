@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
-from typing import Callable, Tuple, Dict, Any, Optional
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as onp
 
@@ -116,33 +118,32 @@ def radial_symmetry_functions(
     particles in the system.
   """
   metric = space.canonicalize_displacement_or_metric(displacement_or_metric)
+  species_array = None if species is None else onp.asarray(species)
 
   def radial_fn(eta: Array, dr: Array) -> Array:
     return jnp.exp(-eta * dr**2) * _cutoff_fn(dr, cutoff_distance)
 
   radial_fn = vmap(radial_fn, (0, None))
 
-  if species is None:
+  if species_array is None:
 
     def compute_fn(R: Array, **kwargs) -> Array:
       _metric = partial(metric, **kwargs)
       _metric = space.map_product(_metric)
       return util.high_precision_sum(radial_fn(etas, _metric(R, R)), axis=1).T
-  elif isinstance(species, jnp.ndarray):
-    species = onp.array(species)
-
+  else:
     def compute_fn(R: Array, **kwargs) -> Array:
       _metric = partial(metric, **kwargs)
       _metric = space.map_product(_metric)
 
       def return_radial(atom_type):
         """Returns the radial symmetry functions for neighbor type atom_type."""
-        R_neigh = R[species == atom_type, :]
+        R_neigh = R[species_array == atom_type, :]
         dr = _metric(R, R_neigh)
         return util.high_precision_sum(radial_fn(etas, dr), axis=1).T
 
       return jnp.hstack(
-        [return_radial(atom_type) for atom_type in onp.unique(species)]
+        [return_radial(atom_type) for atom_type in onp.unique(species_array)]
       )
 
   return compute_fn
@@ -150,7 +151,7 @@ def radial_symmetry_functions(
 
 def radial_symmetry_functions_neighbor_list(
   displacement_or_metric: DisplacementOrMetricFn,
-  species: Array,
+  species: Optional[Array],
   etas: Array,
   cutoff_distance: float,
 ) -> Callable[[Array, NeighborList], Array]:
@@ -184,28 +185,41 @@ def radial_symmetry_functions_neighbor_list(
   radial_fn = vmap(radial_fn, (0, None))
 
   def sym_fn(
-    R: Array, neighbor: NeighborList, mask: Array = None, **kwargs
+    R: Array,
+    neighbor: NeighborList,
+    mask: Optional[Array] = None,
+    **kwargs,
   ) -> Array:
     _metric = partial(metric, **kwargs)
     if neighbor.format is partition.Dense:
       _metric = space.map_neighbor(_metric)
       R_neigh = R[neighbor.idx]
-      mask = True if mask is None else mask[neighbor.idx]
-      mask = (neighbor.idx < R.shape[0])[None, :, :] & mask
+      mask_array = (
+        jnp.ones(neighbor.idx.shape, dtype=bool)
+        if mask is None
+        else mask[neighbor.idx]
+      )
+      mask_array = (neighbor.idx < R.shape[0])[None, :, :] & mask_array
       dr = _metric(R, R_neigh)
-      return util.high_precision_sum(radial_fn(etas, dr) * mask, axis=2).T
+      return util.high_precision_sum(radial_fn(etas, dr) * mask_array, axis=2).T
     elif neighbor.format is partition.Sparse:
       _metric = space.map_bond(_metric)
       dr = _metric(R[neighbor.idx[0]], R[neighbor.idx[1]])
       radial = radial_fn(etas, dr).T
       N = R.shape[0]
-      mask = True if mask is None else mask[neighbor.idx[1]]
-      mask = (neighbor.idx[0] < N) & mask
-      return ops.segment_sum(radial * mask[:, None], neighbor.idx[0], N)
+      mask_array = (
+        jnp.ones(neighbor.idx[1].shape, dtype=bool)
+        if mask is None
+        else mask[neighbor.idx[1]]
+      )
+      mask_array = (neighbor.idx[0] < N) & mask_array
+      return ops.segment_sum(radial * mask_array[:, None], neighbor.idx[0], N)
     else:
       raise ValueError()
 
-  if species is None:
+  species_array = None if species is None else onp.asarray(species)
+
+  if species_array is None:
 
     def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
       return sym_fn(R, neighbor, **kwargs)
@@ -213,14 +227,12 @@ def radial_symmetry_functions_neighbor_list(
     return compute_fn
 
   def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
-    _metric = partial(metric, **kwargs)
-
     def return_radial(atom_type):
       """Returns the radial symmetry functions for neighbor type atom_type."""
-      return sym_fn(R, neighbor, species == atom_type, **kwargs)
+      return sym_fn(R, neighbor, species_array == atom_type, **kwargs)
 
     return jnp.hstack(
-      [return_radial(atom_type) for atom_type in onp.unique(species)]
+      [return_radial(atom_type) for atom_type in onp.unique(species_array)]
     )
 
   return compute_fn
@@ -258,7 +270,7 @@ def single_pair_angular_symmetry_function(
 
 def angular_symmetry_functions(
   displacement: DisplacementFn,
-  species: Array,
+  species: Optional[Array],
   etas: Array,
   lambdas: Array,
   zetas: Array,
@@ -297,7 +309,9 @@ def angular_symmetry_functions(
     vmap(vmap(_batched_angular_fn, (0, None)), (None, 0)), 0
   )
 
-  if species is None:
+  species_array = None if species is None else onp.asarray(species)
+
+  if species_array is None:
 
     def compute_fn(R, **kwargs):
       D_fn = partial(displacement, **kwargs)
@@ -307,14 +321,11 @@ def angular_symmetry_functions(
 
     return compute_fn
 
-  if isinstance(species, jnp.ndarray):
-    species = onp.array(species)
-
   def compute_fn(R, **kwargs):
-    atom_types = onp.unique(species)
+    atom_types = onp.unique(species_array)
     D_fn = partial(displacement, **kwargs)
     D_fn = space.map_product(D_fn)
-    D_different_types = [D_fn(R[species == s, :], R) for s in atom_types]
+    D_different_types = [D_fn(R[species_array == s, :], R) for s in atom_types]
     out = []
     for i in range(len(atom_types)):
       for j in range(i, len(atom_types)):
@@ -331,7 +342,7 @@ def angular_symmetry_functions(
 
 def angular_symmetry_functions_neighbor_list(
   displacement: DisplacementFn,
-  species: Array,
+  species: Optional[Array],
   etas: Array,
   lambdas: Array,
   zetas: Array,
@@ -374,8 +385,8 @@ def angular_symmetry_functions_neighbor_list(
   def sym_fn(
     R: Array,
     neighbor: NeighborList,
-    mask_i: Array = None,
-    mask_j: Array = None,
+    mask_i: Optional[Array] = None,
+    mask_j: Optional[Array] = None,
     **kwargs,
   ) -> Array:
     D_fn = partial(displacement, **kwargs)
@@ -391,15 +402,25 @@ def angular_symmetry_functions_neighbor_list(
       )
       all_angular = _all_pairs_angular(dR, dR)
 
-      mask_i = True if mask_i is None else mask_i[neighbor.idx]
-      mask_j = True if mask_j is None else mask_j[neighbor.idx]
+      mask_i_array = (
+        jnp.ones(neighbor.idx.shape, dtype=bool)
+        if mask_i is None
+        else mask_i[neighbor.idx]
+      )
+      mask_j_array = (
+        jnp.ones(neighbor.idx.shape, dtype=bool)
+        if mask_j is None
+        else mask_j[neighbor.idx]
+      )
 
-      mask_i = (neighbor.idx < R.shape[0]) & mask_i
-      mask_i = mask_i[:, :, jnp.newaxis, jnp.newaxis]
-      mask_j = (neighbor.idx < R.shape[0]) & mask_j
-      mask_j = mask_j[:, jnp.newaxis, :, jnp.newaxis]
+      mask_i_array = (neighbor.idx < R.shape[0]) & mask_i_array
+      mask_i_array = mask_i_array[:, :, jnp.newaxis, jnp.newaxis]
+      mask_j_array = (neighbor.idx < R.shape[0]) & mask_j_array
+      mask_j_array = mask_j_array[:, jnp.newaxis, :, jnp.newaxis]
 
-      return util.high_precision_sum(all_angular * mask_i * mask_j, axis=[1, 2])
+      return util.high_precision_sum(
+        all_angular * mask_i_array * mask_j_array, axis=[1, 2]
+      )
     elif neighbor.format is partition.Sparse:
       D_fn = space.map_bond(D_fn)
       dR = D_fn(R[neighbor.idx[0]], R[neighbor.idx[1]])
@@ -407,12 +428,20 @@ def angular_symmetry_functions_neighbor_list(
       all_angular = _all_pairs_angular(dR, dR)
 
       N = R.shape[0]
-      mask_i = True if mask_i is None else mask_i[neighbor.idx[1]]
-      mask_j = True if mask_j is None else mask_j[neighbor.idx[1]]
-      mask_i = (neighbor.idx[0] < N) & mask_i
-      mask_j = (neighbor.idx[0] < N) & mask_j
+      mask_i_array = (
+        jnp.ones(neighbor.idx[1].shape, dtype=bool)
+        if mask_i is None
+        else mask_i[neighbor.idx[1]]
+      )
+      mask_j_array = (
+        jnp.ones(neighbor.idx[1].shape, dtype=bool)
+        if mask_j is None
+        else mask_j[neighbor.idx[1]]
+      )
+      mask_i_array = (neighbor.idx[0] < N) & mask_i_array
+      mask_j_array = (neighbor.idx[0] < N) & mask_j_array
 
-      mask = mask_i[:, None] & mask_j[None, :]
+      mask = mask_i_array[:, None] & mask_j_array[None, :]
       mask = mask[:, :, None, None]
       all_angular = jnp.reshape(all_angular, (-1,) + all_angular.shape[2:])
       neighbor_idx = jnp.repeat(neighbor.idx[0], len(neighbor.idx[0]))
@@ -421,7 +450,9 @@ def angular_symmetry_functions_neighbor_list(
     else:
       raise ValueError()
 
-  if species is None:
+  species_array = None if species is None else onp.asarray(species)
+
+  if species_array is None:
 
     def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
       return sym_fn(R, neighbor, **kwargs)
@@ -429,12 +460,12 @@ def angular_symmetry_functions_neighbor_list(
     return compute_fn
 
   def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
-    atom_types = onp.unique(species)
+    atom_types = onp.unique(species_array)
     out = []
     for i in range(len(atom_types)):
-      mask_i = species == i
+      mask_i = species_array == i
       for j in range(i, len(atom_types)):
-        mask_j = species == j
+        mask_j = species_array == j
         out += [sym_fn(R, neighbor, mask_i, mask_j)]
     return jnp.hstack(out)
 
@@ -443,7 +474,7 @@ def angular_symmetry_functions_neighbor_list(
 
 def symmetry_functions_neighbor_list(
   displacement: DisplacementFn,
-  species: Array,
+  species: Optional[Array],
   radial_etas: Optional[Array] = None,
   angular_etas: Optional[Array] = None,
   lambdas: Optional[Array] = None,
@@ -471,6 +502,10 @@ def symmetry_functions_neighbor_list(
 
   if zetas is None:
     zetas = jnp.array([1, 1, 2, 2] * 2 + [1, 2] + [1, 2, 4, 16] * 3, f32)
+  assert radial_etas is not None
+  assert angular_etas is not None
+  assert lambdas is not None
+  assert zetas is not None
 
   radial_fn = radial_symmetry_functions_neighbor_list(
     displacement, species, etas=radial_etas, cutoff_distance=cutoff_distance
@@ -518,6 +553,10 @@ def symmetry_functions(
 
   if zetas is None:
     zetas = jnp.array([1, 1, 2, 2] * 2 + [1, 2] + [1, 2, 4, 16] * 3, f32)
+  assert radial_etas is not None
+  assert angular_etas is not None
+  assert lambdas is not None
+  assert zetas is not None
 
   radial_fn = radial_symmetry_functions(
     displacement, species, etas=radial_etas, cutoff_distance=cutoff_distance

@@ -4,6 +4,10 @@ Contains helper functions ReaxFF
 Author: Mehmet Cagri Kaymak
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as onp
@@ -63,18 +67,20 @@ def read_force_field(
   dtype=jnp.float32,
 ):
   # to store all arguments together before creating the class
-  FF_field_dict = {f.name: None for f in fields(ForceField) if f.init}
-  FF_param_to_index = {}
+  FF_field_dict: dict[str, Any] = {
+    f.name: None for f in fields(ForceField) if f.init
+  }
+  FF_param_to_index: dict[tuple[int, int, int], tuple[str, tuple[int, ...]]] = {}
   f = open(force_field_file, 'r')
   header = f.readline().strip()
 
   num_params = int(f.readline().strip().split()[0])
   global_params = onp.zeros(shape=(num_params, 1), dtype=dtype)
-  name_to_index = dict()
-  body_3_indices_src = [[], [], []]
-  body_3_indices_dst = [[], [], []]
-  body_4_indices_src = [[], [], [], []]
-  body_4_indices_dst = [[], [], [], []]
+  name_to_index: dict[str, int] = {}
+  body_3_indices_src: list[Any] = [[], [], []]
+  body_3_indices_dst: list[Any] = [[], [], []]
+  body_4_indices_src: list[Any] = [[], [], [], []]
+  body_4_indices_dst: list[Any] = [[], [], [], []]
 
   for i in range(num_params):
     line = f.readline().strip()

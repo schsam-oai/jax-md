@@ -29,6 +29,8 @@ Example usage:
     >>> print(f"Total energy: {E['total']:.3f} kcal/mol")
 """
 
+from __future__ import annotations
+
 from jax_md.mm_forcefields.oplsaa.energy import energy
 from jax_md.mm_forcefields.oplsaa.topology import (
   create_topology,

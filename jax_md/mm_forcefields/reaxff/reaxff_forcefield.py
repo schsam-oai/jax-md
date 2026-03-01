@@ -4,6 +4,8 @@ Contains force field related code
 Author: Mehmet Cagri Kaymak
 """
 
+from __future__ import annotations
+
 from jax_md import dataclasses, util
 from dataclasses import fields
 import jax
@@ -186,18 +188,18 @@ class ForceField(object):
 
     return cls(**filtered_kwargs)
 
-  def fill_symm(force_field):
+  def fill_symm(self):
     """
     Fills the parameter arrays based on the symmetries
     """
     # 2 body-params
     # for now global
-    num_atoms = force_field.num_atom_types
+    num_atoms = self.num_atom_types
     body_2_indices = jnp.tril_indices(num_atoms, k=-1)
-    body_3_indices_src = force_field.body3_indices_src
-    body_3_indices_dst = force_field.body3_indices_dst
-    body_4_indices_src = force_field.body4_indices_src
-    body_4_indices_dst = force_field.body4_indices_dst
+    body_3_indices_src = self.body3_indices_src
+    body_3_indices_dst = self.body3_indices_dst
+    body_4_indices_src = self.body4_indices_src
+    body_4_indices_dst = self.body4_indices_dst
 
     replace_dict = {}
 
@@ -228,51 +230,51 @@ class ForceField(object):
       'vover',
     ]
     for attr in body_2_attr:
-      arr = getattr(force_field, attr)
+      arr = getattr(self, attr)
       arr = arr.at[body_2_indices].set(arr.transpose()[body_2_indices])
       replace_dict[attr] = arr
 
     body_3_attr = ['vval2', 'vkac', 'th0', 'vka', 'vkap', 'vka3', 'vka8']
     for attr in body_3_attr:
-      arr = getattr(force_field, attr)
+      arr = getattr(self, attr)
       arr = arr.at[body_3_indices_dst].set(arr[body_3_indices_src])
       replace_dict[attr] = arr
 
     body_4_attr = ['v1', 'v2', 'v3', 'v4', 'vconj']
     for attr in body_4_attr:
-      arr = getattr(force_field, attr)
+      arr = getattr(self, attr)
       arr = arr.at[body_4_indices_dst].set(arr[body_4_indices_src])
       replace_dict[attr] = arr
 
-    force_field = dataclasses.replace(force_field, **replace_dict)
+    force_field = dataclasses.replace(self, **replace_dict)
 
     return force_field
 
-  def fill_off_diag(force_field):
+  def fill_off_diag(self):
     """
     Fills the off-diagonal entries in the parameter arrays
     """
-    num_rows = force_field.num_atom_types
-    rat = force_field.rat
-    rapt = force_field.rapt
-    vnq = force_field.vnq
-    rvdw = force_field.rvdw
-    eps = force_field.eps
-    alf = force_field.alf
-    rob1_off = force_field.rob1_off
-    rob2_off = force_field.rob2_off
-    rob3_off = force_field.rob3_off
-    rob1_off_mask = force_field.rob1_off_mask
-    rob2_off_mask = force_field.rob2_off_mask
-    rob3_off_mask = force_field.rob3_off_mask
-    p1co_off = force_field.p1co_off
-    p2co_off = force_field.p2co_off
-    p3co_off = force_field.p3co_off
-    p1co_off_mask = force_field.p1co_off_mask
-    p2co_off_mask = force_field.p2co_off_mask
-    p3co_off_mask = force_field.p3co_off_mask
+    num_rows = self.num_atom_types
+    rat = self.rat
+    rapt = self.rapt
+    vnq = self.vnq
+    rvdw = self.rvdw
+    eps = self.eps
+    alf = self.alf
+    rob1_off = self.rob1_off
+    rob2_off = self.rob2_off
+    rob3_off = self.rob3_off
+    rob1_off_mask = self.rob1_off_mask
+    rob2_off_mask = self.rob2_off_mask
+    rob3_off_mask = self.rob3_off_mask
+    p1co_off = self.p1co_off
+    p2co_off = self.p2co_off
+    p3co_off = self.p3co_off
+    p1co_off_mask = self.p1co_off_mask
+    p2co_off_mask = self.p2co_off_mask
+    p3co_off_mask = self.p3co_off_mask
 
-    softcut = force_field.softcut
+    softcut = self.softcut
 
     mat1 = rat.reshape(1, -1)
     mat1 = jnp.tile(mat1, (num_rows, 1))
@@ -313,7 +315,7 @@ class ForceField(object):
     softcut_2d = 0.5 * (softcut.reshape(-1, 1) + softcut.reshape(1, -1))
 
     force_field = dataclasses.replace(
-      force_field,
+      self,
       rob1=rob1,
       rob2=rob2,
       rob3=rob3,

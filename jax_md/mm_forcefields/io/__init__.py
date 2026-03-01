@@ -3,6 +3,8 @@
 This module provides parsers for various force field file formats.
 """
 
+from __future__ import annotations
+
 from jax_md.mm_forcefields.io.charmm import (
   AtomType,
   Atom,

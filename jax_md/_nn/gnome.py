@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple, Tuple
+from __future__ import annotations
+
+from typing import Any, NamedTuple, Tuple, cast
 
 import os
 
-from jax.core import ShapedArray
+import jax
 from jax import eval_shape
 from jax import random
 from jax.tree_util import tree_map
@@ -63,19 +65,53 @@ def model_from_config(cfg: ConfigDict) -> nn.Module:
 
 
 def minimum_batch_size(cfg: ConfigDict) -> int:
-  if not hasattr(cfg, 'train_batch_size'):
+  train_batch_size = cfg.get('train_batch_size')
+  if train_batch_size is None:
     return 1
-  if isinstance(cfg.train_batch_size, int):
-    return cfg.train_batch_size
-  return min(cfg.train_batch_size)
+  if isinstance(train_batch_size, int):
+    return train_batch_size
+  if isinstance(train_batch_size, list | tuple):
+    return min(int(batch_size) for batch_size in train_batch_size)
+  return int(train_batch_size)
 
 
 class ScaleLROnPlateau(NamedTuple):
-  step_size: Array
-  minimum_loss: Array
-  steps_without_reduction: Array
-  max_steps_without_reduction: Array
-  reduction_factor: Array
+  step_size: jax.Array
+  minimum_loss: jax.Array
+  steps_without_reduction: jax.Array
+  max_steps_without_reduction: jax.Array
+  reduction_factor: jax.Array
+
+
+def _cfg_str(cfg: ConfigDict, key: str, default: str | None = None) -> str:
+  value = cfg.get(key, default)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  return str(value)
+
+
+def _cfg_int(cfg: ConfigDict, key: str, default: int | None = None) -> int:
+  value = cfg.get(key, default)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  if isinstance(value, list | tuple):
+    if not value:
+      raise ValueError(f'Empty config value: {key}')
+    value = value[0]
+  return int(value)
+
+
+def _cfg_float(
+  cfg: ConfigDict, key: str, default: float | None = None
+) -> float:
+  value = cfg.get(key, default)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  if isinstance(value, list | tuple):
+    if not value:
+      raise ValueError(f'Empty config value: {key}')
+    value = value[0]
+  return float(value)
 
 
 def scale_lr_on_plateau(
@@ -86,11 +122,11 @@ def scale_lr_on_plateau(
   def init_fn(params):
     del params
     return ScaleLROnPlateau(
-      initial_step_size,
-      jnp.inf,
-      0,
-      max_steps_without_reduction,
-      reduction_factor,
+      jnp.array(initial_step_size, dtype=f32),
+      jnp.array(jnp.inf, dtype=f32),
+      jnp.array(0, dtype=i32),
+      jnp.array(max_steps_without_reduction, dtype=i32),
+      jnp.array(reduction_factor, dtype=f32),
     )
 
   def update_fn(updates, state, params=None):
@@ -101,40 +137,45 @@ def scale_lr_on_plateau(
   return optax.GradientTransformation(init_fn, update_fn)
 
 
-def optimizer(cfg: ConfigDict) -> optax.OptState:
-  epoch_size = cfg.epoch_size if hasattr(cfg, 'epoch_size') else -1
+def optimizer(cfg: ConfigDict) -> optax.GradientTransformation:
+  epoch_size = _cfg_int(cfg, 'epoch_size', -1)
   # TODO:
   # if epoch_size < 0:
   #   epoch_size = aggregate_dataset_size(cfg.train_dataset)
   # Maybe replace stubbed in value.
 
   batch_size = minimum_batch_size(cfg)
-  total_steps = cfg.epochs * (epoch_size // batch_size)
-  warmup_steps = cfg.get('warmup_steps', 0)
+  total_steps = _cfg_int(cfg, 'epochs') * (epoch_size // batch_size)
+  warmup_steps = _cfg_int(cfg, 'warmup_steps', 0)
+  schedule_name = _cfg_str(cfg, 'schedule')
+  learning_rate = _cfg_float(cfg, 'learning_rate')
 
-  if cfg.schedule == 'constant':
-    schedule = cfg.learning_rate
-  elif cfg.schedule == 'linear_decay':
-    schedule = optax.polynomial_schedule(cfg.learning_rate, 0.0, 1, total_steps)
-  elif cfg.schedule == 'cosine_decay':
-    schedule = optax.cosine_decay_schedule(cfg.learning_rate, total_steps)
-  elif cfg.schedule == 'warmup_cosine_decay':
+  if schedule_name == 'constant':
+    schedule = learning_rate
+  elif schedule_name == 'linear_decay':
+    schedule = optax.polynomial_schedule(learning_rate, 0.0, 1, total_steps)
+  elif schedule_name == 'cosine_decay':
+    schedule = optax.cosine_decay_schedule(learning_rate, total_steps)
+  elif schedule_name == 'warmup_cosine_decay':
     schedule = optax.warmup_cosine_decay_schedule(
-      1e-7, cfg.learning_rate, warmup_steps, total_steps
+      1e-7, learning_rate, warmup_steps, total_steps
     )
-  elif cfg.schedule == 'scale_on_plateau':
-    max_plateau_steps = cfg.max_lr_plateau_epochs // cfg.epochs_per_eval
+  elif schedule_name == 'scale_on_plateau':
+    max_plateau_steps = _cfg_int(
+      cfg, 'max_lr_plateau_epochs'
+    ) // _cfg_int(cfg, 'epochs_per_eval')
     return optax.chain(
       optax.scale_by_adam(),
-      scale_lr_on_plateau(-cfg.learning_rate, max_plateau_steps, 0.8),
+      scale_lr_on_plateau(-learning_rate, max_plateau_steps, 0.8),
     )
   else:
-    raise ValueError(f'Unknown learning rate schedule, "{cfg.schedule}".')
+    raise ValueError(f'Unknown learning rate schedule, "{schedule_name}".')
 
-  if not hasattr(cfg, 'l2_regularization') or cfg.l2_regularization == 0.0:
+  l2_regularization = _cfg_float(cfg, 'l2_regularization', 0.0)
+  if l2_regularization == 0.0:
     return optax.adam(schedule)
 
-  return optax.adamw(schedule, weight_decay=cfg.l2_regularization)
+  return optax.adamw(schedule, weight_decay=l2_regularization)
 
 
 def load_model(directory: str) -> Tuple[ConfigDict, nn.Module, PyTree]:
@@ -147,13 +188,13 @@ def load_model(directory: str) -> Tuple[ConfigDict, nn.Module, PyTree]:
   opt_init, _ = optimizer(c)
 
   graph = GraphsTuple(
-    ShapedArray((1, NUM_ELEMENTS), f32),  # Nodes     (nodes, features)
-    ShapedArray((1, 3), f32),  # dR        (edges, spatial)
-    ShapedArray((1,), i32),  # senders   (edges,)
-    ShapedArray((1,), i32),  # receivers (edges,)
-    ShapedArray((1, 1), f32),  # globals   (graphs,)
-    ShapedArray((1,), i32),  # n_node    (graphs,)
-    ShapedArray((1,), i32),
+    jnp.zeros((1, NUM_ELEMENTS), dtype=f32),  # Nodes     (nodes, features)
+    jnp.zeros((1, 3), dtype=f32),  # dR        (edges, spatial)
+    jnp.zeros((1,), dtype=i32),  # senders   (edges,)
+    jnp.zeros((1,), dtype=i32),  # receivers (edges,)
+    jnp.zeros((1, 1), dtype=f32),  # globals   (graphs,)
+    jnp.zeros((1,), dtype=i32),  # n_node    (graphs,)
+    jnp.zeros((1,), dtype=i32),
   )  # n_edge    (graphs,)
 
   def init_opt_and_model(graph):
@@ -173,7 +214,7 @@ def load_model(directory: str) -> Tuple[ConfigDict, nn.Module, PyTree]:
   checkpoint = os.path.join(directory, checkpoints[0])
 
   with open(checkpoint, 'rb') as f:
-    ckpt = serialization.from_bytes(ckpt_data, f.read())
+    ckpt = cast(tuple[Any, PyTree, Any], serialization.from_bytes(ckpt_data, f.read()))
 
   params = tree_map(lambda x: x.astype(f32), ckpt[1])
   return c, model, params

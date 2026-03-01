@@ -14,11 +14,12 @@
 
 """Kernel-side code for an IPython based visualization tool."""
 
+from __future__ import annotations
+
 import base64
+import importlib
 
-from google.colab import output
-
-import IPython
+from typing import Any, cast
 
 import jax.numpy as jnp
 
@@ -31,6 +32,17 @@ import numpy as np
 
 
 # INTERNAL_FILE_IMPORT
+
+
+try:
+  output: Any = importlib.import_module('google.colab.output')
+except ModuleNotFoundError:
+  output = cast(Any, None)
+
+try:
+  IPython: Any = importlib.import_module('IPython')
+except ModuleNotFoundError:
+  IPython = cast(Any, None)
 
 
 renderer_code = IPython.display.HTML(
@@ -239,7 +251,7 @@ def render(
 
   assert dimension is not None
 
-  if isinstance(box_size, (jnp.ndarray, np.ndarray)):
+  if isinstance(box_size, jnp.ndarray | np.ndarray):
     if box_size.shape:
       assert box_size.shape == (dimension,)
       box_size = list(box_size)
@@ -288,7 +300,7 @@ def render(
     geom = geometry[name]
     geom_dict = dataclasses.asdict(geom)
 
-    geom_metadata = {
+    geom_metadata: dict[str, Any] = {
       'shape': str(geom),
       'fields': {},
     }

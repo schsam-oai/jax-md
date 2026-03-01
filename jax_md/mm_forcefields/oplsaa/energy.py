@@ -1,5 +1,7 @@
 """Energy functions for OPLSAA forcefield."""
 
+from __future__ import annotations
+
 from typing import Callable, Tuple
 
 import jax.numpy as jnp

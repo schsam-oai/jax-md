@@ -19,7 +19,7 @@ from jax_md.mm_forcefields.reaxff.reaxff_helper import (
 from jax_md.mm_forcefields.reaxff.reaxff_forcefield import ForceField
 
 # to resolve circular dependency
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, cast
 
 if TYPE_CHECKING:
   from jax_md.mm_forcefields.reaxff.reaxff_interactions import (
@@ -31,6 +31,7 @@ from jax import custom_jvp
 f32 = util.f32
 f64 = util.f64
 Array = util.Array
+Numeric = util.Numeric
 
 c1c = 332.0638  # Coulomb energy conversion
 rdndgr = 180.0 / onp.pi
@@ -47,7 +48,7 @@ def calculate_reaxff_energy(
   body_4_angles: Array,
   hb_ang_dist: Array,
   force_field: ForceField,
-  init_charges: Array = None,
+  init_charges: Optional[Array] = None,
   total_charge: float = 0.0,
   tol: float = 1e-06,
   max_solver_iter: int = 500,
@@ -123,7 +124,9 @@ def calculate_reaxff_energy(
   close_nbr_inds = jnp.where(nbr_lists.filter2.idx != -1, close_nbr_inds, N)
   body_3_inds = nbr_lists.filter3.idx
   body_4_inds = nbr_lists.filter4.idx
-  if nbr_lists.filter_hb != None:
+  assert body_3_inds is not None
+  assert body_4_inds is not None
+  if nbr_lists.filter_hb is not None:
     hb_inds = nbr_lists.filter_hb.idx
   else:
     hb_inds = None
@@ -169,7 +172,9 @@ def calculate_reaxff_energy(
       far_nbr_dists < xcut, lambda x: x, bond_softness, 0.0
     )
     self_mask = jnp.arange(N).reshape(-1, 1) == far_nbr_inds
-    bond_softness = jnp.where(self_mask == 1, 0, bond_softness)
+    bond_softness = cast(
+      Array, jnp.where(self_mask == 1, 0, bond_softness)
+    )
     charges, effpot = calculate_acks2_charges(
       species,
       atom_mask,
@@ -290,7 +295,7 @@ def calculate_reaxff_energy(
   result_dict['E_torsion_conj'] = tor_conj
   result_dict['E_hbond'] = 0.0
 
-  if hb_inds != None:
+  if hb_inds is not None:
     hb_mask = (hb_inds[:, 1] != -1) & (hb_inds[:, 2] != -1)
 
     hb_pot = calculate_hb_pot(
@@ -330,7 +335,7 @@ def calculate_eem_charges(
   tapered_dists: Array,
   idempotential: Array,
   electronegativity: Array,
-  init_charges: Array = None,
+  init_charges: Optional[Array] = None,
   total_charge: float = 0.0,
   backprop_solve: bool = False,
   tol: float = 1e-06,
@@ -425,37 +430,6 @@ def calculate_acks2_charges(
   my_idemp = idempotential[species]
   my_elect = electronegativity[species]
   B = bond_softness
-
-  def to_dense():
-    a_inds = jnp.arange(N)
-    A_ = jax.vmap(
-      lambda j: jax.vmap(lambda i: jnp.sum(A[i] * (nbr_inds[i] == j)))(a_inds)
-    )(a_inds)
-    diag_inds = jnp.diag_indices(N)
-    A_ = A_.at[diag_inds].add(2.0 * my_idemp)
-
-    B_ = jax.vmap(
-      lambda j: jax.vmap(
-        lambda i: jnp.sum(B[i] * ((nbr_inds[i] == j) & (i != j)))
-      )(a_inds)
-    )(a_inds)
-    diags_B = jnp.sum(B_, axis=0)
-    B_ = B_.at[diag_inds].add(-1 * diags_B)
-
-    matrix = jnp.zeros(shape=(2 * N + 2, 2 * N + 2), dtype=prev_dtype)
-    matrix = matrix.at[:N, :N].set(A_)
-    matrix = matrix.at[N : 2 * N, N : 2 * N].set(B_)
-
-    matrix = matrix.at[N : 2 * N, :N].set(jnp.eye(N))
-    matrix = matrix.at[:N, N : 2 * N].set(jnp.eye(N))
-
-    matrix = matrix.at[2 * N, N : 2 * N].set(atom_mask)
-    matrix = matrix.at[N : 2 * N, 2 * N].set(atom_mask)
-
-    matrix = matrix.at[2 * N + 1, :N].set(atom_mask)
-    matrix = matrix.at[:N, 2 * N + 1].set(atom_mask)
-
-    return matrix
 
   def SPMV_dense(vec):
     res = jnp.zeros(shape=(N + 1,), dtype=jnp.float64)
@@ -671,7 +645,7 @@ def calculate_covbon_pot(
     )
   else:
     bo = bor - force_field.cutoff
-  bo = jnp.where(bo <= 0, 0.0, bo)
+  bo = cast(Array, jnp.where(bo <= 0, 0.0, bo))
   abo = jnp.sum(bo, axis=1)
 
   bo, bopi, bopi2 = calculate_boncor_pot(
@@ -814,8 +788,13 @@ def calculate_boncor_pot(
 
 
 def smooth_lone_pair_casting(
-  number, p_lambda=0.9999, l1=-1.3, l2=-0.3, r1=0.3, r2=1.3
-):
+  number: Array,
+  p_lambda: float = 0.9999,
+  l1: float = -1.3,
+  l2: float = -0.3,
+  r1: float = 0.3,
+  r2: float = 1.3,
+) -> Array:
   part_2 = (1 / jnp.pi) * (
     jnp.arctan(
       p_lambda
@@ -828,19 +807,12 @@ def smooth_lone_pair_casting(
 
   f_L = number + 1 / 2 - part_2
 
-  result = jnp.where(
-    number < l1,
-    f_L,
-    jnp.where(
-      number < l2,
-      f_L * taper(number, l1, l2),
-      jnp.where(
-        number < r1,
-        0,
-        jnp.where(number <= r2, f_R * taper_inc(number, r1, r2), f_R),
-      ),
-    ),
+  upper = cast(
+    Array, jnp.where(number <= r2, f_R * taper_inc(number, r1, r2), f_R)
   )
+  middle = cast(Array, jnp.where(number < r1, f32(0.0), upper))
+  lower = cast(Array, jnp.where(number < l2, f_L * taper(number, l1, l2), middle))
+  result = cast(Array, jnp.where(number < l1, f_L, lower))
 
   return result
 
@@ -1059,18 +1031,24 @@ def calculate_valency_pot(
   sbo2 = sbo2 + (1 - vmbo) * (-exbo - force_field.val_par34 * vlpadj)
   sbo2 = jnp.clip(sbo2, 0, 2.0)
   # add 1e-20 so that ln(a) is not nan
-  sbo2 = vectorized_cond(
-    sbo2 < 1,
-    lambda x: (x + 1e-15) ** force_field.val_par17,
-    lambda x: sbo2,
-    sbo2,
+  sbo2 = cast(
+    Array,
+    vectorized_cond(
+      sbo2 < 1,
+      lambda x: (x + 1e-15) ** force_field.val_par17,
+      lambda x: sbo2,
+      sbo2,
+    ),
   )
 
-  sbo2 = vectorized_cond(
-    sbo2 >= 1,
-    lambda x: 2.0 - (2.0 - x + 1e-15) ** force_field.val_par17,
-    lambda x: sbo2,
-    sbo2,
+  sbo2 = cast(
+    Array,
+    vectorized_cond(
+      sbo2 >= 1,
+      lambda x: 2.0 - (2.0 - x + 1e-15) ** force_field.val_par17,
+      lambda x: sbo2,
+      sbo2,
+    ),
   )
 
   expsbo = jnp.exp(-force_field.val_par18 * (2.0 - sbo2))
@@ -1368,7 +1346,9 @@ def calculate_hb_pot(
   return hb_pot
 
 
-def taper(value, low_tap_rad, up_tap_rad):
+def taper(
+  value: Numeric, low_tap_rad: Numeric, up_tap_rad: Numeric
+) -> Array:
   """
   Decreasing tapering function
   1 at low_tap_rad and 0 at up_tap_rad
@@ -1415,12 +1395,15 @@ def taper(value, low_tap_rad, up_tap_rad):
     - SWC1 * R
     + SWC0
   ) / D7
-  SW = jnp.where(R < low_tap_rad, 1.0, jnp.where(R < up_tap_rad, SW, 0.0))
+  tapered = cast(Array, jnp.where(R < up_tap_rad, SW, f32(0.0)))
+  SW = cast(Array, jnp.where(R < low_tap_rad, f32(1.0), tapered))
 
   return SW
 
 
-def taper_inc(dist, low_tap_rad=0, up_tap_rad=10):
+def taper_inc(
+  dist: Numeric, low_tap_rad: Numeric = 0, up_tap_rad: Numeric = 10
+) -> Array:
   """
   Increasing tapering function
   0 at low_tap_rad and 1 at up_tap_rad

@@ -4,6 +4,8 @@ This parser is generic and can be used with any force field that uses
 CHARMM-format parameter files (e.g., CHARMM, OPLSAA, CGenFF, etc.).
 """
 
+from __future__ import annotations
+
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 import jax.numpy as jnp

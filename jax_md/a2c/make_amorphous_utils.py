@@ -14,6 +14,8 @@
 
 """Utilities for generating amorphous structures."""
 
+from __future__ import annotations
+
 import itertools
 import json
 from typing import Any, Sequence
@@ -54,7 +56,9 @@ def get_diameter(composition) -> float:
 
 def random_packed_structure(
   composition: Composition,
-  lattice: Sequence[Sequence[onp.float32]],
+  lattice: jax_md_util.Array
+  | onp.ndarray[Any, Any]
+  | Sequence[Sequence[onp.float32]],
   seed: int = 42,
   diameter: float | None = None,
   auto_diameter: bool = False,
@@ -82,7 +86,8 @@ def random_packed_structure(
   for i, el in enumerate(element_symbols):
     for _ in range(element_counts[i]):
       species.append(el)
-  lattice = jnp.array(lattice)
+  lattice_array = jnp.array(lattice)
+  lattice_np = onp.asarray(lattice)
   key = random.PRNGKey(seed)
   _, split = random.split(key)
   R = random.uniform(split, (sum(element_counts), 3), dtype=onp.float32)
@@ -98,14 +103,14 @@ def random_packed_structure(
 
   if diameter is not None:
     print('Reduce atom overlap using the soft_sphere potential')
-    R_cart = jnp.dot(R, lattice)
-    box = jnp.array(lattice.T)
+    R_cart = jnp.dot(R, lattice_array)
+    box = jnp.array(lattice_array.T)
     displacement, shift = space.periodic_general(
       box, fractional_coordinates=False, wrapped=False
     )
-    diameter = jax_md_util.maybe_downcast(diameter)
+    diameter_value = jax_md_util.maybe_downcast(diameter)
     energy_fn = energy.soft_sphere_pair(
-      displacement, sigma=diameter
+      displacement, sigma=diameter_value
     )  # pytype: disable=wrong-arg-types
     fire_init, fire_apply = minimize.fire_descent(energy_fn, shift)
     fire_apply = jit(fire_apply)
@@ -115,7 +120,7 @@ def random_packed_structure(
       fire_state = fire_apply(fire_state)
       # We break the loop early if desired min distance is reasonble.
       s = Structure(
-        lattice, species, fire_state.position, coords_are_cartesian=True
+        lattice_np, species, fire_state.position, coords_are_cartesian=True
       )  # pytype: disable=wrong-arg-types
       if min_distance(s) > diameter * 0.95:
         break
@@ -129,7 +134,7 @@ def random_packed_structure(
   Cartesian
   """.format(
     composition=composition,
-    lattice=onp.array_str(lattice).replace('[', '').replace(']', ''),
+    lattice=onp.array_str(lattice_np).replace('[', '').replace(']', ''),
     element_symbols=' '.join(element_symbols),
     element_counts=' '.join([str(i) for i in element_counts]),
   )

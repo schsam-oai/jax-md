@@ -14,9 +14,11 @@
 
 """Implementation of Particle Mesh Ewald sums following Essmann et al. 1995."""
 
+from __future__ import annotations
+
 from functools import wraps, partial
 
-from typing import Callable, Tuple, TextIO, Dict, Any, Optional
+from typing import Any, Callable, Dict, Optional, TextIO
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +35,7 @@ from jax_md import space, smap, partition, quantity, util
 f32 = util.f32
 f64 = util.f64
 Array = util.Array
+Numeric = util.Numeric
 
 PyTree = Any
 Box = space.Box
@@ -56,9 +59,9 @@ def coulomb_direct(dr: Array, charge_sq: Array, alpha: float) -> Array:
 def coulomb_direct_pair(
   displacement_fn: DisplacementOrMetricFn,
   charge: Array,
-  species: Array = None,
+  species: Optional[Array] = None,
   alpha: float = 0.35,
-) -> Callable[[Array], Array]:
+) -> Callable[..., Array]:
   return smap.pair(
     coulomb_direct,
     space.canonicalize_displacement_or_metric(displacement_fn),
@@ -72,11 +75,11 @@ def coulomb_direct_neighbor_list(
   displacement_or_metric: DisplacementOrMetricFn,
   box: Box,
   charge: Array,
-  species: Array = None,
+  species: Optional[Array] = None,
   alpha: float = 0.35,
   cutoff: float = 9.0,
   **neighbor_kwargs,
-) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+) -> tuple[NeighborFn, Callable[..., Array]]:
   neighbor_fn = partition.neighbor_list(
     space.canonicalize_displacement_or_metric(displacement_or_metric),
     box,
@@ -104,7 +107,7 @@ def coulomb_direct_neighbor_list(
 
 def coulomb_recip_ewald(
   charge: Array, side_length: Array, alpha: float, g_max: float
-) -> Callable[[Array], Array]:
+) -> Callable[..., Array]:
   def energy_fn(position, **kwargs):
     dim = position.shape[-1]
     V = side_length**dim
@@ -134,7 +137,7 @@ def coulomb_recip_pme(
   grid_points: Array,
   fractional_coordinates: bool = False,
   alpha: float = 0.34,
-) -> Callable[[Array], Array]:
+) -> Callable[..., Array]:
   _ibox = space.inverse(box)
 
   def energy_fn(R, **kwargs):
@@ -151,17 +154,23 @@ def coulomb_recip_pme(
     Fgrid = jnp.fft.fftn(grid)
 
     mx, my, mz = jnp.meshgrid(*[jnp.fft.fftfreq(g) for g in grid_dimensions])
-    if jnp.isscalar(_box):
+    if isinstance(_box, int | float):
       m_2 = (mx**2 + my**2 + mz**2) * (grid_dimensions[0] * ibox) ** 2
       V = (1.0 * _box) ** dim
     else:
+      ibox_array = jnp.asarray(ibox)
+      box_array = jnp.asarray(_box)
       m = (
-        ibox[None, None, None, 0] * mx[:, :, :, None] * grid_dimensions[0]
-        + ibox[None, None, None, 1] * my[:, :, :, None] * grid_dimensions[1]
-        + ibox[None, None, None, 2] * mz[:, :, :, None] * grid_dimensions[2]
+        ibox_array[None, None, None, 0] * mx[:, :, :, None] * grid_dimensions[0]
+        + ibox_array[None, None, None, 1]
+        * my[:, :, :, None]
+        * grid_dimensions[1]
+        + ibox_array[None, None, None, 2]
+        * mz[:, :, :, None]
+        * grid_dimensions[2]
       )
       m_2 = jnp.sum(m**2, axis=-1)
-      V = jnp.linalg.det(_box)
+      V = jnp.linalg.det(box_array)
     mask = m_2 != 0
 
     exp_m = 1 / (2 * jnp.pi * V) * jnp.exp(-(jnp.pi**2) * m_2 / alpha**2) / m_2
@@ -176,13 +185,13 @@ def coulomb_recip_pme(
 
 
 def coulomb_ewald_neighbor_list(
-  displacement_fn: Array,
+  displacement_fn: DisplacementOrMetricFn,
   box: Array,
   charge: Array,
-  species: Array = None,
+  species: Optional[Array] = None,
   alpha: float = 0.34,
   g_max: float = 5.0,
-) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+) -> tuple[NeighborFn, Callable[..., Array]]:
   neighbor_fn, direct_fn = coulomb_direct_neighbor_list(
     displacement_fn, box, charge, species=species, alpha=alpha
   )
@@ -199,10 +208,10 @@ def coulomb(
   box: Box,
   charge: Array,
   grid_points: Array,
-  species: Array = None,
+  species: Optional[Array] = None,
   alpha: float = 0.34,
   fractional_coordinates: bool = False,
-) -> Callable[[Array], Array]:
+) -> Callable[..., Array]:
   direct_fn = coulomb_direct_pair(
     displacement_fn, charge, species=species, alpha=alpha
   )
@@ -221,11 +230,11 @@ def coulomb_neighbor_list(
   box: Box,
   charge: Array,
   grid_points: Array,
-  species: Array = None,
+  species: Optional[Array] = None,
   alpha: float = 0.34,
   cutoff: float = 9.0,
   fractional_coordinates: bool = False,
-) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+) -> tuple[NeighborFn, Callable[..., Array]]:
   nbr_box = (
     jnp.diag(box) if (isinstance(box, jnp.ndarray) and box.ndim == 2) else box
   )
@@ -251,7 +260,7 @@ def coulomb_neighbor_list(
 # Utility functions.
 
 
-def structure_factor(g, R, q=1):
+def structure_factor(g: Array, R: Array, q: Numeric = 1) -> Array:
   if isinstance(q, jnp.ndarray):
     q = q[None, :]
   return util.high_precision_sum(

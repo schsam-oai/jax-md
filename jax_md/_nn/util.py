@@ -14,7 +14,9 @@
 
 """Neural Network Primitives."""
 
-from typing import Union, Dict, Callable, Tuple, Optional
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional, Tuple, Union, cast
 
 import functools
 
@@ -103,7 +105,7 @@ class MLP(nn.Module):
 
 def mlp(
   hidden_features: Union[int, Tuple[int, ...]], nonlinearity: str, **kwargs
-) -> Callable[..., Array]:
+) -> Callable[..., Any]:
   if isinstance(hidden_features, int):
     hidden_features = (hidden_features,)
 
@@ -162,7 +164,10 @@ class BesselEmbedding(nn.Module):
       return jnp.arange(1, n + 1) * jnp.pi
 
     frequencies = self.param('frequencies', init_fn, (self.count,))
-    bessel_fn = partial(bessel, self.outer_cutoff, frequencies)
+
+    def bessel_fn(r: Array) -> Array:
+      return cast(Array, bessel(self.outer_cutoff, frequencies, r))
+
     bessel_fn = vmap(
       energy.multiplicative_isotropic_cutoff(
         bessel_fn, self.inner_cutoff, self.outer_cutoff
@@ -180,10 +185,24 @@ class BesselEmbedding(nn.Module):
 DATASET_SHIFT_SCALE = {'harder_silicon': (2.2548, 0.8825)}
 
 
+def _cfg_float(cfg: ConfigDict, key: str) -> float:
+  value = cfg.get(key)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  if isinstance(value, list | tuple):
+    if not value:
+      raise ValueError(f'Empty config value: {key}')
+    value = value[0]
+  return float(value)
+
+
 def get_shift_and_scale(cfg: ConfigDict) -> Tuple[float, float]:
   if hasattr(cfg, 'scale') and hasattr(cfg, 'shift'):
-    return cfg.shift, cfg.scale
-  elif hasattr(cfg, 'train_dataset'):
-    return DATASET_SHIFT_SCALE[cfg.train_dataset[0]]
+    return _cfg_float(cfg, 'shift'), _cfg_float(cfg, 'scale')
+  train_dataset = cfg.get('train_dataset')
+  if isinstance(train_dataset, list | tuple) and train_dataset:
+    return DATASET_SHIFT_SCALE[str(train_dataset[0])]
+  elif isinstance(train_dataset, str):
+    return DATASET_SHIFT_SCALE[train_dataset]
   else:
     raise ValueError()

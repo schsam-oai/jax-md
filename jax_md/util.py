@@ -14,24 +14,36 @@
 
 """Defines utility functions."""
 
-from typing import Iterable, Union, Optional, Any
+from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+from importlib import import_module
+from typing import Any, Optional, TypeGuard, cast
+
+import jax
 from jax.tree_util import register_pytree_node
+from jax.typing import ArrayLike
 import jax.numpy as jnp
 from jax import jit
 
 from functools import partial
 
 import numpy as onp
+import numpy.typing as npt
 
-# Backward compatible import for get_backend
 try:
-  from jax.extend.backend import get_backend
-except (ImportError, AttributeError):
-  from jax.lib.xla_bridge import get_backend
+  get_backend = cast(
+    Callable[[], Any], import_module('jax.extend.backend').get_backend
+  )
+except ModuleNotFoundError:
+  get_backend = cast(
+    Callable[[], Any], import_module('jax.lib.xla_bridge').get_backend
+  )
 
-Array = jnp.ndarray
+Array = jax.Array | npt.NDArray[Any]
 PyTree = Any
+Scalar = int | float
+Numeric = Scalar | Array
 
 i16 = jnp.int16
 i32 = jnp.int32
@@ -41,35 +53,38 @@ f32 = jnp.float32
 f64 = jnp.float64
 
 
-CUSTOM_SIMULATION_TYPE = []
+CUSTOM_SIMULATION_TYPE: list[type[Any]] = []
 
 
-def register_custom_simulation_type(t: Any):
+def register_custom_simulation_type(t: type[Any]) -> None:
   global CUSTOM_SIMULATION_TYPE
   CUSTOM_SIMULATION_TYPE += [t]
 
 
-def check_custom_simulation_type(x: Any) -> bool:
+def check_custom_simulation_type(x: Any) -> None:
   if type(x) in CUSTOM_SIMULATION_TYPE:
     raise ValueError()
 
 
-def static_cast(*xs):
+def static_cast(*xs: ArrayLike) -> tuple[Array, ...]:
   """Function to cast a value to the lowest dtype that can express it."""
   # NOTE(schsam): static_cast is so named because it cannot be jit.
   if get_backend().platform == 'tpu':
-    return (jnp.array(x, jnp.float32) for x in xs)
-  else:
-    return (jnp.array(x, dtype=onp.min_scalar_type(x)) for x in xs)
+    return tuple(jnp.array(x, jnp.float32) for x in xs)
+  return tuple(jnp.array(x, dtype=onp.min_scalar_type(x)) for x in xs)
 
 
-def register_pytree_namedtuple(cls):
+def register_pytree_namedtuple(cls: type[Any]) -> None:
   register_pytree_node(
     cls, lambda xs: (tuple(xs), None), lambda _, xs: cls(*xs)
   )
 
 
-def merge_dicts(a, b, ignore_unused_parameters=False):
+def merge_dicts(
+  a: dict[Any, Any],
+  b: dict[Any, Any],
+  ignore_unused_parameters: bool = False,
+) -> dict[Any, Any]:
   if not ignore_unused_parameters:
     return {**a, **b}
 
@@ -82,14 +97,19 @@ def merge_dicts(a, b, ignore_unused_parameters=False):
 
 
 @partial(jit, static_argnums=(1,))
-def safe_mask(mask, fn, operand, placeholder=0):
+def safe_mask(
+  mask: Array,
+  fn: Callable[[Array], Array],
+  operand: Array,
+  placeholder: ArrayLike = 0,
+) -> Array:
   masked = jnp.where(mask, operand, 0)
   return jnp.where(mask, fn(masked), placeholder)
 
 
 def high_precision_sum(
   X: Array,
-  axis: Optional[Union[Iterable[int], int]] = None,
+  axis: Optional[int | Sequence[int]] = None,
   keepdims: bool = False,
 ):
   """Sums over axes at 64-bit precision then casts back to original dtype."""
@@ -105,14 +125,14 @@ def high_precision_sum(
   )
 
 
-def maybe_downcast(x):
+def maybe_downcast(x: Any) -> Array:
   if isinstance(x, jnp.ndarray) and x.dtype is jnp.dtype('float64'):
     return x
   return jnp.array(x, f32)
 
 
-def is_array(x: Any) -> bool:
-  return isinstance(x, (jnp.ndarray, onp.ndarray))
+def is_array(x: object) -> TypeGuard[Array]:
+  return isinstance(x, jnp.ndarray | onp.ndarray)
 
 
 def safe_norm(
