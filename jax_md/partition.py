@@ -823,6 +823,7 @@ def neighbor_list(
   custom_mask_function: Optional[MaskFn] = None,
   fractional_coordinates: bool = False,
   format: NeighborListFormat = NeighborListFormat.Dense,
+  use_experimental_sparse_neighbor_list: bool = False,
   **static_kwargs,
 ) -> NeighborFn:
   """Returns a function that builds a list neighbors for collections of points.
@@ -896,18 +897,18 @@ def neighbor_list(
       cell size used in the cell list will be set to `cutoff / box_size`.
     format: The format of the neighbor list; see the :meth:`NeighborListFormat` enum
       for details about the different choices for formats. Defaults to `Dense`.
+    use_experimental_sparse_neighbor_list: Enables the direct sparse
+      neighbor-list path for supported sparse cases. When `False`, sparse
+      neighbor lists use the legacy candidate-materialization path.
     **static_kwargs: kwargs that get threaded through the calculation of
       example positions.
   Returns:
     A NeighborListFns object that contains a method to allocate a new neighbor
     list and a method to update an existing neighbor list.
   """
-  sparse_backend = static_kwargs.pop('sparse_backend', 'legacy')
-  if sparse_backend not in ('legacy', 'direct'):
-    raise ValueError(
-      'Neighbor list sparse_backend must be one of '
-      f'("legacy", "direct"). Found {sparse_backend}.'
-    )
+  sparse_backend = (
+    'direct' if use_experimental_sparse_neighbor_list else 'legacy'
+  )
 
   is_format_valid(format)
   box = lax.stop_gradient(box)
@@ -920,6 +921,11 @@ def neighbor_list(
   cutoff_sq = cutoff**2
   threshold_sq = (dr_threshold / f32(2)) ** 2
   metric_sq = _displacement_or_metric_to_metric_sq(displacement_or_metric)
+  # Allocation is usually a cold or infrequent Python path. Always jitting
+  # these helpers makes repeated same-shape allocation much faster for large
+  # systems, but it also adds a large compile penalty that dominates smaller or
+  # one-off allocations. Keep a size threshold so we only pay that compile cost
+  # when it is likely to amortize.
   sparse_allocation_jit_threshold = 4096
   custom_mask_uses_edges = _mask_uses_edge_pairs(custom_mask_function)
 
@@ -1189,9 +1195,7 @@ def neighbor_list(
   def direct_sparse_max_occupancy(
     N: int, raw_count: Array, extra_capacity: int
   ) -> int:
-    max_occupancy = int(
-      int(jax.device_get(raw_count)) * capacity_multiplier + N * extra_capacity
-    )
+    max_occupancy = int(int(raw_count) * capacity_multiplier + N * extra_capacity)
     return min(
       max_occupancy, _neighbor_list_capacity_limit(N, format, mask_self)
     )

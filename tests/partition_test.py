@@ -217,7 +217,7 @@ class NeighborListTest(test_util.JAXMDTestCase):
       cutoff,
       dr_threshold,
       1.1,
-      sparse_backend='direct',
+      use_experimental_sparse_neighbor_list=True,
       **kwargs,
     )
     return legacy_fn, direct_fn
