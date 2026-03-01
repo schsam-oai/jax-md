@@ -50,6 +50,8 @@ map_neighbor:
   `[n, neighbors, spatial_dim]`.
 """
 
+from __future__ import annotations
+
 from typing import Callable, Union, Tuple, Any, Optional
 
 from jax.core import ShapedArray
@@ -71,14 +73,14 @@ from jax_md.util import safe_mask
 # Types
 
 
-DisplacementFn = Callable[[Array, Array], Array]
-MetricFn = Callable[[Array, Array], float]
+DisplacementFn = Callable[..., Array]
+MetricFn = Callable[..., Array]
 DisplacementOrMetricFn = Union[DisplacementFn, MetricFn]
 
-ShiftFn = Callable[[Array, Array], Array]
+ShiftFn = Callable[..., Array]
 
 Space = Tuple[DisplacementFn, ShiftFn]
-Box = Array
+Box = float | int | Array
 
 
 # Exceptions
@@ -93,11 +95,13 @@ class UnexpectedBoxException(Exception):
 
 def inverse(box: Box) -> Box:
   """Compute the inverse of an affine transformation."""
-  if jnp.isscalar(box) or box.size == 1:
+  if isinstance(box, int | float):
     return 1 / box
-  elif box.ndim == 1:
+  if box.size == 1:
     return 1 / box
-  elif box.ndim == 2:
+  if box.ndim == 1:
+    return 1 / box
+  if box.ndim == 2:
     return jnp.linalg.inv(box)
   raise ValueError(
     (f'Box must be either: a scalar, a vector, or a matrix. Found {box}.')
@@ -120,12 +124,14 @@ def raw_transform(box: Box, R: Array) -> Array:
   Returns:
     A transformed array positions of shape `(..., spatial_dimension)`.
   """
-  if jnp.isscalar(box) or box.size == 1:
+  if isinstance(box, int | float):
     return R * box
-  elif box.ndim == 1:
+  if box.size == 1:
+    return R * box
+  if box.ndim == 1:
     indices = _get_free_indices(R.ndim - 1) + 'i'
     return jnp.einsum(f'i,{indices}->{indices}', box, R)
-  elif box.ndim == 2:
+  if box.ndim == 2:
     free_indices = _get_free_indices(R.ndim - 1)
     left_indices = free_indices + 'j'
     right_indices = free_indices + 'i'

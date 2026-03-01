@@ -1,5 +1,7 @@
 """Neighbor list utilities for molecular mechanics forcefields."""
 
+from __future__ import annotations
+
 import jax.numpy as jnp
 from jax_md import partition
 from jax_md.partition import NeighborFn

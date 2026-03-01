@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 from jax_md import dataclasses, partition, space
 from jax_md.partition import NeighborListFormat
-from typing import Callable, Tuple, Union, Optional
+from typing import Any, Callable, Optional, Tuple, Union, cast
 
 # Type aliases
 Array = jnp.ndarray
@@ -56,7 +58,7 @@ class NeighborListMultiImage:
   update_fn: Callable[..., 'NeighborListMultiImage'] = (
     dataclasses.static_field()
   )
-  did_buffer_overflow: bool = False
+  did_buffer_overflow: bool | Array = False
 
   def update(self, position: Array, **kwargs) -> 'NeighborListMultiImage':
     """Update neighbor list with new positions."""
@@ -86,7 +88,9 @@ class NeighborListMultiImage:
     N = len(self.reference_position)
     if self.format is NeighborListFormat.Dense:
       # Count valid entries in Dense format
-      return int(jnp.sum(self.idx < N))
+      idx = self.idx
+      assert not isinstance(idx, tuple)
+      return int(jnp.sum(idx < N))
     return int(jnp.sum(self.idx[0] < N))
 
   @property
@@ -96,7 +100,9 @@ class NeighborListMultiImage:
       raise ValueError(
         'max_neighbors property only available for Dense format.'
       )
-    return self.idx.shape[1]
+    idx = self.idx
+    assert not isinstance(idx, tuple)
+    return idx.shape[1]
 
   @property
   def n_node(self) -> int:
@@ -465,13 +471,13 @@ def _build_neighbor_list_orderedsparse(
     is_zero = jnp.all(s == 0)
     return jnp.where(is_zero, True, first_val > 0)
 
-  shift_is_canonical = jax.vmap(is_shift_canonical)(shifts)  # [num_shifts]
+  shift_is_canonical = cast(Array, jax.vmap(is_shift_canonical)(shifts))
 
   # Keep mask: zero shift -> i < j, non-zero -> canonical shifts only
   keep_mask = jnp.where(
     zero_shift_mask[:, None, None],
     i_idx < j_idx,
-    shift_is_canonical[:, None, None],
+    jnp.expand_dims(jnp.expand_dims(shift_is_canonical, axis=1), axis=2),
   )  # [num_shifts, N, N]
 
   within_cutoff = within_cutoff & keep_mask
@@ -896,10 +902,14 @@ def neighbor_list_multi_image(
   threshold_sq = (dr_threshold / 2.0) ** 2
 
   # Placeholder for circular reference in NeighborListMultiImage.update
-  def update_fn_placeholder(position, neighbors, **kwargs):
+  def update_fn_placeholder(
+    position: Array, neighbors: NeighborListMultiImage, **kwargs
+  ) -> NeighborListMultiImage:
     raise NotImplementedError()
 
-  update_fn_ref = [update_fn_placeholder]
+  update_fn_ref: list[Callable[..., NeighborListMultiImage]] = [
+    update_fn_placeholder
+  ]
 
   # Cache for JIT-compiled build functions per capacity
   # This avoids recompilation when N stays constant across calls
@@ -1126,7 +1136,7 @@ def graph_featurizer(displacement_fn=None):
     Returns:
       GraphsTuple with displacement vectors as edges.
     """
-    graph = partition.to_jraph(neighbor, nodes=atoms)
+    graph = partition.to_jraph(cast(Any, neighbor), nodes=atoms)
     mask = neighbor_list_multi_image_mask(neighbor)
 
     # Use box from kwargs if provided, else from neighbor list
@@ -1149,53 +1159,3 @@ def graph_featurizer(displacement_fn=None):
     return graph._replace(edges=dR)
 
   return featurize
-
-
-def _compute_displacements(
-  position: Array,  # [N, dim]
-  neighbors: NeighborListMultiImage,
-  fractional_coordinates: bool = True,
-) -> Array:  # [capacity, dim]
-  r"""Compute displacement vectors for all edges in a neighbor list.
-
-  For each edge from receiver :math:`i` to sender :math:`j` with shift
-  :math:`\mathbf{s}`, computes:
-
-  .. math::
-
-    \mathbf{d}_{ij}^{\mathbf{s}} = \mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i
-
-  where :math:`\mathbf{T}` is the box matrix.
-
-  Uses ``space.transform`` for coordinate conversion so that gradients w.r.t.
-  fractional inputs are real-space gradients (see ``space.transform_jvp``).
-
-  Args:
-    position: Atom positions. Shape ``[N, dim]``.
-    neighbors: A ``NeighborListMultiImage`` (Sparse or OrderedSparse format).
-    fractional_coordinates: If True, positions are in fractional coordinates.
-
-  Returns:
-    Displacement vectors in Cartesian coordinates. Shape ``[capacity, dim]``.
-    Invalid edges are set to zero. Use ``neighbor_list_mask(neighbors)`` to
-    filter valid edges.
-  """
-  box = neighbors.box  # [dim, dim]
-  N = position.shape[0]
-  mask = neighbor_list_multi_image_mask(neighbors)  # [capacity]
-
-  if fractional_coordinates:
-    position_real = space.transform(box, position)  # [N, dim]
-  else:
-    position_real = position
-
-  # Safe indexing for padding (clip to valid range)
-  i_safe = jnp.clip(neighbors.receivers, 0, N - 1)  # [capacity]
-  j_safe = jnp.clip(neighbors.senders, 0, N - 1)  # [capacity]
-  shifts_real = space.transform(box, neighbors.shifts)  # [capacity, dim]
-
-  # Displacement: r_j + shift - r_i
-  dR = (
-    position_real[j_safe] + shifts_real - position_real[i_safe]
-  )  # [capacity, dim]
-  return jnp.where(mask[:, None], dR, 0.0)

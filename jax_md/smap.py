@@ -14,6 +14,8 @@
 
 """Code to transform functions on individual tuples of particles to sets."""
 
+from __future__ import annotations
+
 from functools import reduce, partial
 
 from typing import Dict, Callable, List, Tuple, Union, Optional
@@ -93,13 +95,16 @@ class ParameterTree:
   mapping: ParameterTreeMapping = dataclasses.static_field()
 
 
-Parameter = Union[ParameterTree, Array, float]
+Parameter = Union[ParameterTree, Array, float, int]
+SpeciesKey = Array | tuple[int, int] | None
 
 
 # Mapping potential functional forms to bonds.
 
 
-def _get_bond_type_parameters(params: Array, bond_type: Array) -> Array:
+def _get_bond_type_parameters(
+  params: Parameter, bond_type: Array
+) -> Parameter:
   """Get parameters for interactions for bonds indexed by a bond-type."""
   # TODO(schsam): We should do better error checking here.
   assert util.is_array(bond_type)
@@ -135,8 +140,8 @@ def _get_bond_type_parameters(params: Array, bond_type: Array) -> Array:
 
 
 def _kwargs_to_bond_parameters(
-  bond_type: Array, kwargs: Dict[str, Array]
-) -> Dict[str, Array]:
+  bond_type: Optional[Array], kwargs: Dict[str, Parameter]
+) -> Dict[str, Parameter]:
   """Extract parameters from keyword arguments."""
   # NOTE(schsam): We could pull out the species case from the generic case.
   for k, v in kwargs.items():
@@ -243,7 +248,9 @@ def bond(
 # Mapping potential functional forms to pairwise interactions.
 
 
-def _get_species_parameters(params: Parameter, species: Array) -> Parameter:
+def _get_species_parameters(
+  params: Parameter, species: Array | tuple[int, int]
+) -> Parameter:
   """Get parameters for interactions between species pairs."""
   # TODO(schsam): We should do better error checking here.
   if util.is_array(params):
@@ -314,8 +321,10 @@ def _get_matrix_parameters(
 
 
 def _kwargs_to_parameters(
-  species: Array, kwargs: Dict[str, Parameter], combinators: Dict[str, Callable]
-) -> Dict[str, Array]:
+  species: SpeciesKey,
+  kwargs: Dict[str, Parameter],
+  combinators: Dict[str, Callable[[Array, Array], Array]],
+) -> Dict[str, Parameter]:
   """Extract parameters from keyword arguments."""
   # NOTE(schsam): We could pull out the species case from the generic case.
   s_kwargs = {}
@@ -332,6 +341,11 @@ def _kwargs_to_parameters(
 
 def _diagonal_mask(X: Array) -> Array:
   """Sets the diagonal of a matrix to zero."""
+  if len(X.shape) < 2:
+    raise ValueError(
+      'Diagonal mask can only mask rank-2 or rank-3 tensors. '
+      f'Found {len(X.shape)}.'
+    )
   if X.shape[0] != X.shape[1]:
     raise ValueError(
       'Diagonal mask can only mask square matrices. Found {}x{}.'.format(
@@ -462,7 +476,7 @@ def pair(
 
   if species is None:
 
-    def fn_mapped(R: Array, **dynamic_kwargs) -> Array:
+    def mapped_fn_no_species(R: Array, **dynamic_kwargs) -> Array:
       d = space.map_product(partial(displacement_or_metric, **dynamic_kwargs))
       _kwargs = merge_dicts(kwargs, dynamic_kwargs)
       _kwargs = _kwargs_to_parameters(None, _kwargs, param_combinators)
@@ -472,6 +486,7 @@ def pair(
       return high_precision_sum(
         _diagonal_mask(fn(dr, **_kwargs)), axis=reduce_axis, keepdims=keepdims
       ) * f32(0.5)
+    return mapped_fn_no_species
   elif util.is_array(species):
     species = onp.array(species)
     _check_species_dtype(species)
@@ -480,7 +495,7 @@ def pair(
       # TODO(schsam): Support reduce_axis with static species.
       raise ValueError
 
-    def fn_mapped(R, **dynamic_kwargs):
+    def mapped_fn_static_species(R: Array, **dynamic_kwargs) -> Array:
       U = f32(0.0)
       d = space.map_product(partial(displacement_or_metric, **dynamic_kwargs))
       for i in range(species_count + 1):
@@ -497,10 +512,13 @@ def pair(
             dU = high_precision_sum(fn(dr, **s_kwargs))
             U = U + dU
       return U
+    return mapped_fn_static_species
   elif isinstance(species, int):
     species_count = species
 
-    def fn_mapped(R, species, **dynamic_kwargs):
+    def mapped_fn_dynamic_species(
+      R: Array, species: Array, **dynamic_kwargs
+    ) -> Array:
       _check_species_dtype(species)
       U = f32(0.0)
       N = R.shape[0]
@@ -518,13 +536,13 @@ def pair(
           dU = mask * fn(dr, **s_kwargs)
           U = U + high_precision_sum(dU, axis=reduce_axis, keepdims=keepdims)
       return U / f32(2.0)
+    return mapped_fn_dynamic_species
   else:
     raise ValueError(
       'Species must be None, an ndarray, or an integer. Found {}.'.format(
         species
       )
     )
-  return fn_mapped
 
 
 # Mapping pairwise functional forms to systems using neighbor lists.
@@ -545,14 +563,14 @@ def _get_neighborhood_matrix_params(
         return space.map_neighbor(combinator)(params, params[idx])
     elif params.ndim == 2:
 
-      def query(id_a, id_b):
+      def query_matrix(id_a: Array, id_b: Array) -> Array:
         return params[id_a, id_b]
 
       if partition.is_sparse(format):
-        return space.map_bond(query)(idx[0], idx[1])
+        return space.map_bond(query_matrix)(idx[0], idx[1])
       else:
-        query = vmap(vmap(query, (None, 0)))
-        return query(jnp.arange(idx.shape[0], dtype=jnp.int32), idx)
+        vectorized_query = vmap(vmap(query_matrix, (None, 0)))
+        return vectorized_query(jnp.arange(idx.shape[0], dtype=jnp.int32), idx)
     elif params.ndim == 0:
       return params
     else:
@@ -572,15 +590,15 @@ def _get_neighborhood_matrix_params(
         return tree_map(lambda p: c_fn(p, p[idx]), params.tree)
     elif params.mapping is ParameterTreeMapping.PerBond:
 
-      def query(p, id_a, id_b):
+      def query_tree(p: Array, id_a: Array, id_b: Array) -> Array:
         return p[id_a, id_b]
 
       if partition.is_sparse(format):
-        c_fn = lambda p: space.map_bond(partial(query, p))(idx[0], idx[1])
+        c_fn = lambda p: space.map_bond(partial(query_tree, p))(idx[0], idx[1])
         return tree_map(c_fn, params.tree)
       else:
         r = jnp.arange(idx.shape[0], dtype=jnp.int32)
-        c_fn = lambda p: vmap(vmap(partial(query, p), (None, 0)))(r, idx)
+        c_fn = lambda p: vmap(vmap(partial(query_tree, p), (None, 0)))(r, idx)
         return tree_map(c_fn, params.tree)
     else:
       raise ValueError(
@@ -610,17 +628,16 @@ def _get_neighborhood_species_params(
   """Get parameters for interactions between species pairs."""
 
   # TODO(schsam): We should do better error checking here.
-  def lookup(p, species_a, species_b):
-    return p[species_a, species_b]
-
   if util.is_array(params):
-    lookup = partial(lookup, params)
+    def lookup_params(species_a: Array, species_b: Array) -> Array:
+      return params[species_a, species_b]
+
     if len(params.shape) == 2:
       if partition.is_sparse(format):
-        return space.map_bond(lookup)(species[idx[0]], species[idx[1]])
+        return space.map_bond(lookup_params)(species[idx[0]], species[idx[1]])
       else:
-        lookup = vmap(vmap(lookup, (None, 0)))
-        return lookup(species, species[idx])
+        vectorized_lookup = vmap(vmap(lookup_params, (None, 0)))
+        return vectorized_lookup(species, species[idx])
     elif len(params.shape) == 0:
       return params
     else:
@@ -631,13 +648,16 @@ def _get_neighborhood_species_params(
     if params.mapping is ParameterTreeMapping.Global:
       return params.tree
     elif params.mapping is ParameterTreeMapping.PerSpecies:
+      def lookup_tree(p: Array, species_a: Array, species_b: Array) -> Array:
+        return p[species_a, species_b]
+
       if partition.is_sparse(format):
-        l_fn = lambda p: space.map_bond(partial(lookup, p))(
+        l_fn = lambda p: space.map_bond(partial(lookup_tree, p))(
           species[idx[0]], species[idx[1]]
         )
         return tree_map(l_fn, params.tree)
       else:
-        l_fn = lambda p: vmap(vmap(partial(lookup, p), (None, 0)))(
+        l_fn = lambda p: vmap(vmap(partial(lookup_tree, p), (None, 0)))(
           species, species[idx]
         )
         return tree_map(l_fn, params.tree)
@@ -652,32 +672,25 @@ def _get_neighborhood_species_params(
 def _neighborhood_kwargs_to_params(
   format: partition.NeighborListFormat,
   idx: Array,
-  species: Array,
-  kwargs: Dict[str, Array],
-  combinators: Dict[str, Callable],
-) -> Dict[str, Array]:
+  species: Optional[Array],
+  kwargs: Dict[str, Parameter],
+  combinators: Dict[str, Callable[[Array, Array], Array]],
+) -> Dict[str, Parameter]:
   out_dict = {}
   for k in kwargs:
-    if species is None or (util.is_array(kwargs[k]) and kwargs[k].ndim == 1):
+    parameter = kwargs[k]
+    if species is None or (util.is_array(parameter) and parameter.ndim == 1):
       combinator = combinators.get(k, lambda x, y: 0.5 * (x + y))
       out_dict[k] = _get_neighborhood_matrix_params(
-        format, idx, kwargs[k], combinator
+        format, idx, parameter, combinator
       )
     else:
       if k in combinators:
         raise ValueError()
       out_dict[k] = _get_neighborhood_species_params(
-        format, idx, species, kwargs[k]
+        format, idx, species, parameter
       )
   return out_dict
-
-
-def _vectorized_cond(
-  pred: Array, fn: Callable[[Array], Array], operand: Array
-) -> Array:
-  masked = jnp.where(pred, operand, 1)
-  return jnp.where(pred, fn(masked), 0)
-
 
 def pair_neighbor_list(
   fn: Callable[..., Array],
@@ -882,7 +895,7 @@ def triplet(
 
   if species is None:
 
-    def fn_mapped(R, **dynamic_kwargs) -> Array:
+    def mapped_triplet_no_species(R: Array, **dynamic_kwargs) -> Array:
       d = space.map_product(partial(displacement_or_metric, **dynamic_kwargs))
       _kwargs = merge_dicts(kwargs, dynamic_kwargs)
       _kwargs = _kwargs_to_parameters(species, _kwargs, {})
@@ -894,9 +907,12 @@ def triplet(
       return (
         high_precision_sum(output, axis=reduce_axis, keepdims=keepdims) / 2.0
       )
+    return mapped_triplet_no_species
   elif util.is_array(species):
 
-    def fn_mapped(R, **dynamic_kwargs):
+    def mapped_triplet_static_species(
+      R: Array, **dynamic_kwargs
+    ) -> Array:
       d = partial(displacement_or_metric, **dynamic_kwargs)
       idx = onp.tile(onp.arange(R.shape[0]), [R.shape[0], 1])
       dR = vmap(vmap(d, (None, 0)))(R, R[idx])
@@ -938,10 +954,10 @@ def triplet(
       return (
         high_precision_sum(output, axis=reduce_axis, keepdims=keepdims) / 2.0
       )
+    return mapped_triplet_static_species
   elif isinstance(species, int):
     raise NotImplementedError
   else:
     raise ValueError(
       'Species must be None, an ndarray, or Dynamic. Found {}.'.format(species)
     )
-  return fn_mapped

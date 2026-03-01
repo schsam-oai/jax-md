@@ -1,5 +1,7 @@
 """Base dataclasses and types for molecular mechanics forcefields."""
 
+from __future__ import annotations
+
 from typing import NamedTuple, Optional
 from jax_md.util import Array
 

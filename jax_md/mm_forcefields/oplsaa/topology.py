@@ -1,5 +1,7 @@
 """Topology management for OPLSAA forcefield."""
 
+from __future__ import annotations
+
 import jax.numpy as jnp
 from jax_md.mm_forcefields.base import Topology
 from jax_md.mm_forcefields import neighbor

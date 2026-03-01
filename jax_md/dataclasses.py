@@ -19,20 +19,24 @@ This code was copied and adapted from https://github.com/google/flax/struct.py.
 Accessed on 04/29/2020.
 """
 
+from __future__ import annotations
+
 import dataclasses
-from dataclasses import Field as _Field
 from dataclasses import asdict as _asdict
 from dataclasses import astuple as _astuple
 from dataclasses import field as _field
 from dataclasses import fields as _fields
 from dataclasses import is_dataclass as _is_dataclass
 from dataclasses import replace as _replace
-from typing import Any, Callable, Optional, TypeVar, overload
+from typing import Any, Callable, Optional, TypeVar, cast, overload
+
+from typing_extensions import dataclass_transform
 
 import jax
 
 __all__ = (
   'dataclass',
+  'Settable',
   'static_field',
   'unpack',
   'replace',
@@ -44,22 +48,66 @@ __all__ = (
 )
 
 
-T = TypeVar('T', bound=type[Any])
+T = TypeVar('T')
+S = TypeVar('S', bound='Settable')
+_MISSING = dataclasses.MISSING
+
+
+class Settable:
+  """Mixin that provides a typed persistent update helper for dataclasses."""
+
+  def set(self: S, **kwargs: Any) -> S:
+    return cast(S, _replace(cast(Any, self), **kwargs))
+
+
+def static_field(
+  *,
+  default: Any = _MISSING,
+  default_factory: Any = _MISSING,
+  init: bool = True,
+  repr: bool = True,
+  hash: bool | None = None,
+  compare: bool = True,
+  metadata: dict[str, Any] | None = None,
+  kw_only: bool = False,
+  **field_kwargs: Any,
+) -> Any:
+  """Create a field that is treated as static (non-pytree) by JAX."""
+  combined_metadata = dict(metadata or {})
+  combined_metadata.setdefault('static', True)
+  combined_metadata['pytree_node'] = False
+  return _field(
+    default=default,
+    default_factory=default_factory,
+    init=init,
+    repr=repr,
+    hash=hash,
+    compare=compare,
+    metadata=combined_metadata,
+    kw_only=kw_only,
+    **field_kwargs,
+  )
 
 
 @overload
-def dataclass(clz: T, *, frozen: bool = True, **dataclass_kwargs: Any) -> T: ...
+def dataclass(
+  clz: type[T], *, frozen: bool = True, **dataclass_kwargs: Any
+) -> type[T]: ...
 
 
 @overload
 def dataclass(
   *, frozen: bool = True, **dataclass_kwargs: Any
-) -> Callable[[T], T]: ...
+) -> Callable[[type[T]], type[T]]: ...
 
 
+@dataclass_transform(field_specifiers=(static_field, _field))
 def dataclass(
-  clz: Optional[T] = None, *, frozen: bool = True, **dataclass_kwargs: Any
-) -> T | Callable[[T], T]:
+  clz: Optional[type[T]] = None,
+  *,
+  frozen: bool = True,
+  **dataclass_kwargs: Any,
+) -> type[T] | Callable[[type[T]], type[T]]:
   """Create a class which can be passed to functional transformations.
 
   Jax transformations such as `jax.jit` and `jax.grad` require objects that are
@@ -84,32 +132,19 @@ def dataclass(
         "'frozen' must match the decorator argument when provided in dataclass_kwargs"
       )
 
-  def decorate(target_clz: T) -> T:
+  def decorate(target_clz: type[T]) -> type[T]:
     data_clz = dataclasses.dataclass(frozen=frozen, **dataclass_kwargs)(
       target_clz
     )
     registered_clz = jax.tree_util.register_dataclass(data_clz)
-
-    def _set(self, **kwargs):
-      return _replace(self, **kwargs)
-
-    setattr(registered_clz, 'set', _set)
+    if not hasattr(registered_clz, 'set'):
+      setattr(registered_clz, 'set', Settable.set)
     return registered_clz
 
   if clz is None:
     return decorate
 
   return decorate(clz)
-
-
-def static_field(
-  *, metadata: Optional[dict[str, Any]] = None, **field_kwargs: Any
-) -> _Field[Any]:
-  """Create a field that is treated as static (non-pytree) by JAX."""
-  combined_metadata = dict(metadata or {})
-  combined_metadata.setdefault('static', True)
-  combined_metadata['pytree_node'] = False
-  return _field(metadata=combined_metadata, **field_kwargs)
 
 
 def unpack(dc: Any) -> tuple[Any, ...]:

@@ -14,6 +14,8 @@
 
 """Defines testing utility functions."""
 
+from __future__ import annotations
+
 from absl import flags
 from absl.testing import parameterized
 
@@ -72,7 +74,7 @@ def device_under_test():
   return getattr(FLAGS, 'jax_test_dut', None) or jax.default_backend()
 
 
-_DEFAULT_TOLERANCE = {
+_DEFAULT_TOLERANCE: dict[object, float] = {
   onp.dtype(onp.bool_): 0,
   onp.dtype(onp.int32): 0,
   onp.dtype(onp.int64): 0,
@@ -192,7 +194,8 @@ class JAXMDTestCase(parameterized.TestCase):
       self.assertDtypesMatch(x, y)
 
   def assertDtypesMatch(self, x, y, *, canonicalize_dtypes=True):
-    if not jax.config.x64_enabled and canonicalize_dtypes:
+    x64_enabled = bool(getattr(jax.config, 'x64_enabled', False))
+    if not x64_enabled and canonicalize_dtypes:
       self.assertEqual(
         _dtypes.canonicalize_dtype(_dtype(x)),
         _dtypes.canonicalize_dtype(_dtype(y)),

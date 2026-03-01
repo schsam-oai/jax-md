@@ -14,7 +14,9 @@
 
 """Neural Network Primitives."""
 
-from typing import Callable, Tuple, Dict, Any, Optional
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 import numpy as onp
 
@@ -45,7 +47,7 @@ Array = jmd_util.Array
 f32 = jmd_util.f32
 f64 = jmd_util.f64
 
-InitFn = Callable[..., Array]
+InitFn = Callable[..., Any]
 CallFn = Callable[..., Array]
 
 DisplacementOrMetricFn = space.DisplacementOrMetricFn
@@ -98,34 +100,48 @@ class GraphsTuple(object):
       `edge_idx[i, j] == N_nodes`.
   """
 
-  nodes: jnp.ndarray
-  edges: jnp.ndarray
-  globals: jnp.ndarray
-  edge_idx: jnp.ndarray
-
-  _replace = dataclasses.replace
+  nodes: Optional[Array]
+  edges: Optional[Array]
+  globals: Optional[Array]
+  edge_idx: Array
 
 
-def concatenate_graph_features(graphs: Tuple[GraphsTuple, ...]) -> GraphsTuple:
+GraphLike = GraphsTuple | jraph.GraphsTuple
+
+
+def _replace_graph(graph: GraphLike, **kwargs) -> GraphLike:
+  if isinstance(graph, GraphsTuple):
+    return dataclasses.replace(graph, **kwargs)
+  return cast(Any, graph)._replace(**kwargs)
+
+
+def concatenate_graph_features(graphs: Tuple[GraphLike, ...]) -> GraphLike:
   """Given a list of GraphsTuple returns a new concatenated GraphsTuple.
 
   Note that currently we do not check that the graphs have consistent edge
   connectivity.
   """
   graph = graphs[0]
-  return graph._replace(
-    nodes=jnp.concatenate([g.nodes for g in graphs], axis=-1),
-    edges=jnp.concatenate([g.edges for g in graphs], axis=-1),
+  nodes = [g.nodes for g in graphs]
+  edges = [g.edges for g in graphs]
+  globals_ = [g.globals for g in graphs]
+  assert all(node is not None for node in nodes)
+  assert all(edge is not None for edge in edges)
+  assert all(global_ is not None for global_ in globals_)
+  return _replace_graph(
+    graph,
+    nodes=jnp.concatenate(cast(list[Array], nodes), axis=-1),
+    edges=jnp.concatenate(cast(list[Array], edges), axis=-1),
     globals=jnp.concatenate(
-      [g.globals for g in graphs], axis=-1
+      cast(list[Array], globals_), axis=-1
     ),  # pytype: disable=missing-parameter
   )
 
 
 def GraphMapFeatures(
-  edge_fn: Callable[[Array], Array],
-  node_fn: Callable[[Array], Array],
-  global_fn: Callable[[Array], Array],
+  edge_fn: Optional[Callable[[Array], Array]],
+  node_fn: Optional[Callable[[Array], Array]],
+  global_fn: Optional[Callable[[Array], Array]],
 ) -> Callable[[GraphsTuple], GraphsTuple]:
   """Applies functions independently to the nodes, edges, and global states."""
   identity = lambda x: x
@@ -145,8 +161,9 @@ def GraphMapFeatures(
 
 
 def _apply_node_fn(
-  graph: GraphsTuple, node_fn: Callable[[Array, Array, Array, Array], Array]
+  graph: GraphsTuple, node_fn: Callable[..., Array]
 ) -> Array:
+  assert graph.nodes is not None
   mask = graph.edge_idx < graph.nodes.shape[0]
   mask = mask[:, :, jnp.newaxis]
 
@@ -173,17 +190,15 @@ def _apply_node_fn(
 
 
 def _apply_edge_fn(
-  graph: GraphsTuple, edge_fn: Callable[[Array, Array, Array, Array], Array]
+  graph: GraphsTuple, edge_fn: Callable[..., Array]
 ) -> Array:
-  if graph.nodes is not None:
-    incoming_nodes = graph.nodes[graph.edge_idx]
-    outgoing_nodes = jnp.broadcast_to(
-      graph.nodes[:, jnp.newaxis, :],
-      graph.edge_idx.shape + graph.nodes.shape[-1:],
-    )
-  else:
-    incoming_nodes = None
-    outgoing_nodes = None
+  assert graph.nodes is not None
+  assert graph.edges is not None
+  incoming_nodes = graph.nodes[graph.edge_idx]
+  outgoing_nodes = jnp.broadcast_to(
+    graph.nodes[:, jnp.newaxis, :],
+    graph.edge_idx.shape + graph.nodes.shape[-1:],
+  )
 
   if graph.globals is not None:
     _globals = jnp.broadcast_to(
@@ -199,11 +214,12 @@ def _apply_edge_fn(
 
 
 def _apply_global_fn(
-  graph: GraphsTuple, global_fn: Callable[[Array, Array, Array], Array]
+  graph: GraphsTuple, global_fn: Callable[..., Array]
 ) -> Array:
   nodes = None if graph.nodes is None else jnp.sum(graph.nodes, axis=0)
 
   if graph.edges is not None:
+    assert graph.nodes is not None
     mask = graph.edge_idx < graph.nodes.shape[0]
     mask = mask[:, :, jnp.newaxis]
     edges = jnp.sum(graph.edges * mask, axis=(0, 1))
@@ -221,9 +237,9 @@ class GraphNetwork:
 
   def __init__(
     self,
-    edge_fn: Callable[[Array], Array],
-    node_fn: Callable[[Array], Array],
-    global_fn: Callable[[Array], Array],
+    edge_fn: Optional[Callable[..., Array]],
+    node_fn: Optional[Callable[..., Array]],
+    global_fn: Optional[Callable[..., Array]],
   ):
     self._node_fn = (
       None
@@ -298,31 +314,43 @@ class GraphNetEncoder(hk.Module):
     )(jnp.concatenate(args, axis=-1))
 
     if format is partition.Dense:
-      self._encoder = GraphMapFeatures(
-        embedding_fn('EdgeEncoder'),
-        embedding_fn('NodeEncoder'),
-        embedding_fn('GlobalEncoder'),
+      self._encoder = cast(
+        Callable[[GraphLike], GraphLike],
+        GraphMapFeatures(
+          embedding_fn('EdgeEncoder'),
+          embedding_fn('NodeEncoder'),
+          embedding_fn('GlobalEncoder'),
+        ),
       )
-      self._propagation_network = lambda: GraphNetwork(
-        model_fn('EdgeFunction'),
-        model_fn('NodeFunction'),
-        model_fn('GlobalFunction'),
+      self._propagation_network = lambda: cast(
+        Callable[[GraphLike], GraphLike],
+        GraphNetwork(
+          model_fn('EdgeFunction'),
+          model_fn('NodeFunction'),
+          model_fn('GlobalFunction'),
+        ),
       )
     elif format is partition.Sparse:
-      self._encoder = jraph.GraphMapFeatures(
-        embedding_fn('EdgeEncoder'),
-        embedding_fn('NodeEncoder'),
-        embedding_fn('GlobalEncoder'),
+      self._encoder = cast(
+        Callable[[GraphLike], GraphLike],
+        jraph.GraphMapFeatures(
+          embedding_fn('EdgeEncoder'),
+          embedding_fn('NodeEncoder'),
+          embedding_fn('GlobalEncoder'),
+        ),
       )
-      self._propagation_network = lambda: jraph.GraphNetwork(
-        model_fn('EdgeFunction'),
-        model_fn('NodeFunction'),
-        model_fn('GlobalFunction'),
+      self._propagation_network = lambda: cast(
+        Callable[[GraphLike], GraphLike],
+        jraph.GraphNetwork(
+          model_fn('EdgeFunction'),
+          model_fn('NodeFunction'),
+          model_fn('GlobalFunction'),
+        ),
       )
     else:
       raise ValueError()
 
-  def __call__(self, graph: GraphsTuple) -> GraphsTuple:
+  def __call__(self, graph: GraphLike) -> GraphLike:
     encoded = self._encoder(graph)
     outputs = encoded
 

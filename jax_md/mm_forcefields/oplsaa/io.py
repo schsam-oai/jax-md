@@ -5,6 +5,8 @@ This module provides basic support for loading CHARMM/NAMD style files (`.pdb`,
 objects used throughout `jax_md`.
 """
 
+from __future__ import annotations
+
 import jax.numpy as jnp
 from typing import Tuple, Optional, List, Set
 from jax_md.mm_forcefields.oplsaa.topology import create_topology

@@ -33,9 +33,11 @@ also return a function that computes the invariant for that ensemble. This
 can be used for testing purposes, but is not often used otherwise.
 """
 
+from __future__ import annotations
+
 from collections import namedtuple
 
-from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple, TypeVar, Union
 
 import functools
 
@@ -60,6 +62,7 @@ static_cast = util.static_cast
 
 
 Array = util.Array
+Numeric = util.Numeric
 f32 = util.f32
 f64 = util.f64
 
@@ -68,9 +71,19 @@ Box = space.Box
 ShiftFn = space.ShiftFn
 
 T = TypeVar('T')
+StateT = TypeVar('StateT', bound='SimulationState')
 InitFn = Callable[..., T]
-ApplyFn = Callable[[T], T]
+ApplyFn = Callable[..., T]
 Simulator = Tuple[InitFn, ApplyFn]
+
+
+class SimulationState(Protocol):
+  position: Any
+  mass: Any
+  momentum: Any
+  force: Any
+
+  def set(self: StateT, **kwargs: Any) -> StateT: ...
 
 
 """Dispatch By State Code.
@@ -116,7 +129,7 @@ class dispatch_by_state:
 
 
 @dispatch_by_state
-def canonicalize_mass(state: T) -> T:
+def canonicalize_mass(state: StateT) -> StateT:
   """Reshape mass vector for broadcasting with positions."""
 
   def canonicalize_fn(mass):
@@ -138,7 +151,7 @@ def canonicalize_mass(state: T) -> T:
 
 
 @dispatch_by_state
-def initialize_momenta(state: T, key: Array, kT: float) -> T:
+def initialize_momenta(state: StateT, key: Array, kT: float) -> StateT:
   """Initialize momenta with the Maxwell-Boltzmann distribution."""
   R, mass = state.position, state.mass
 
@@ -159,7 +172,7 @@ def initialize_momenta(state: T, key: Array, kT: float) -> T:
 
 
 @dispatch_by_state
-def momentum_step(state: T, dt: float) -> T:
+def momentum_step(state: StateT, dt: float) -> StateT:
   """Apply a single step of the time evolution operator for momenta."""
   assert hasattr(state, 'momentum')
   new_momentum = tree_map(lambda p, f: p + dt * f, state.momentum, state.force)
@@ -167,9 +180,11 @@ def momentum_step(state: T, dt: float) -> T:
 
 
 @dispatch_by_state
-def position_step(state: T, shift_fn: Callable, dt: float, **kwargs) -> T:
+def position_step(
+  state: StateT, shift_fn: Callable[..., Any], dt: float, **kwargs
+) -> StateT:
   """Apply a single step of the time evolution operator for positions."""
-  if isinstance(shift_fn, Callable):
+  if callable(shift_fn):
     shift_fn = tree_map(lambda r: shift_fn, state.position)
   new_position = tree_map(
     lambda s_fn, r, p, m: s_fn(r, dt * p / m, **kwargs),
@@ -182,13 +197,13 @@ def position_step(state: T, shift_fn: Callable, dt: float, **kwargs) -> T:
 
 
 @dispatch_by_state
-def kinetic_energy(state: T) -> Array:
+def kinetic_energy(state: SimulationState) -> Numeric:
   """Compute the kinetic energy of a state."""
   return quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
 
 
 @dispatch_by_state
-def temperature(state: T) -> Array:
+def temperature(state: SimulationState) -> Numeric:
   """Compute the temperature of a state."""
   return quantity.temperature(momentum=state.momentum, mass=state.mass)
 
@@ -221,9 +236,9 @@ def velocity_verlet(
   force_fn: Callable[..., Array],
   shift_fn: ShiftFn,
   dt: float,
-  state: T,
+  state: StateT,
   **kwargs,
-) -> T:
+) -> StateT:
   """Apply a single step of velocity Verlet integration to a state."""
   dt = f32(dt)
   dt_2 = f32(dt / 2)
@@ -240,7 +255,7 @@ def velocity_verlet(
 
 
 @dataclasses.dataclass
-class NVEState:
+class NVEState(dataclasses.Settable):
   """A struct containing the state of an NVE simulation.
 
   This tuple stores the state of a simulation that samples from the
@@ -261,7 +276,7 @@ class NVEState:
   position: Array
   momentum: Array
   force: Array
-  mass: Array
+  mass: Numeric
 
   @property
   def velocity(self) -> Array:
@@ -292,7 +307,7 @@ def nve(energy_or_force_fn, shift_fn, dt=1e-3, **sim_kwargs):
   @jit
   def init_fn(key, R, kT, mass=f32(1.0), **kwargs):
     force = force_fn(R, **kwargs)
-    state = NVEState(R, None, force, mass)
+    state = NVEState(R, jnp.zeros_like(R), force, mass)
     state = canonicalize_mass(state)
     return initialize_momenta(state, key, kT)
 
@@ -335,7 +350,7 @@ SUZUKI_YOSHIDA_WEIGHTS = {
 
 
 @dataclasses.dataclass
-class NoseHooverChain:
+class NoseHooverChain(dataclasses.Settable):
   """State information for a Nose-Hoover chain.
 
   Attributes:
@@ -356,7 +371,7 @@ class NoseHooverChain:
   position: Array
   momentum: Array
   mass: Array
-  tau: Array
+  tau: Numeric
   kinetic_energy: Array
   degrees_of_freedom: int = dataclasses.static_field()
 
@@ -369,7 +384,7 @@ class NoseHooverChainFns:
 
 
 def nose_hoover_chain(
-  dt: float, chain_length: int, chain_steps: int, sy_steps: int, tau: float
+  dt: float, chain_length: int, chain_steps: int, sy_steps: int, tau: Numeric
 ) -> NoseHooverChainFns:
   r"""Helper function to simulate a Nose-Hoover Chain coupled to a system.
 
@@ -504,7 +519,9 @@ def nose_hoover_chain(
   return NoseHooverChainFns(init_fn, half_step_chain_fn, update_chain_mass_fn)
 
 
-def default_nhc_kwargs(tau: float, overrides: Dict) -> Dict:
+def default_nhc_kwargs(
+  tau: float, overrides: Optional[Dict[Any, Any]]
+) -> Dict[str, float | int]:
   default_kwargs = {
     'chain_length': 3,
     'chain_steps': 2,
@@ -521,7 +538,7 @@ def default_nhc_kwargs(tau: float, overrides: Dict) -> Dict:
 
 
 @dataclasses.dataclass
-class NVTNoseHooverState:
+class NVTNoseHooverState(dataclasses.Settable):
   """State information for an NVT system with a Nose-Hoover chain thermostat.
 
   Attributes:
@@ -539,7 +556,7 @@ class NVTNoseHooverState:
   position: Array
   momentum: Array
   force: Array
-  mass: Array
+  mass: Numeric
   chain: NoseHooverChain
 
   @property
@@ -551,11 +568,11 @@ def nvt_nose_hoover(
   energy_or_force_fn: Callable[..., Array],
   shift_fn: ShiftFn,
   dt: float,
-  kT: float,
+  kT: Numeric,
   chain_length: int = 5,
   chain_steps: int = 2,
   sy_steps: int = 3,
-  tau: Optional[float] = None,
+  tau: Optional[Numeric] = None,
   **sim_kwargs,
 ) -> Simulator:
   """Simulation in the NVT ensemble using a Nose Hoover Chain thermostat.
@@ -606,11 +623,11 @@ def nvt_nose_hoover(
   force_fn = quantity.canonicalize_force(energy_or_force_fn)
   dt = f32(dt)
   dt_2 = f32(dt / 2)
-  if tau is None:
-    tau = dt * 100
-  tau = f32(tau)
+  tau_value = dt * 100 if tau is None else tau
 
-  thermostat = nose_hoover_chain(dt, chain_length, chain_steps, sy_steps, tau)
+  thermostat = nose_hoover_chain(
+    dt, chain_length, chain_steps, sy_steps, tau_value
+  )
 
   @jit
   def init_fn(key, R, mass=f32(1.0), **kwargs):
@@ -618,7 +635,14 @@ def nvt_nose_hoover(
 
     dof = quantity.count_dof(R)
 
-    state = NVTNoseHooverState(R, None, force_fn(R, **kwargs), mass, None)
+    zero_ke = jnp.zeros((), dtype=R.dtype)
+    state = NVTNoseHooverState(
+      R,
+      jnp.zeros_like(R),
+      force_fn(R, **kwargs),
+      mass,
+      thermostat.initialize(dof, zero_ke, _kT),
+    )
     state = canonicalize_mass(state)
     state = initialize_momenta(state, key, _kT)
     KE = kinetic_energy(state)
@@ -650,9 +674,9 @@ def nvt_nose_hoover(
 def nvt_nose_hoover_invariant(
   energy_fn: Callable[..., Array],
   state: NVTNoseHooverState,
-  kT: float,
+  kT: Numeric,
   **kwargs,
-) -> float:
+) -> Numeric:
   """The conserved quantity for the NVT ensemble with a Nose-Hoover thermostat.
 
   This function is normally used for debugging the Nose-Hoover thermostat.
@@ -680,7 +704,7 @@ def nvt_nose_hoover_invariant(
 
 
 @dataclasses.dataclass
-class NPTNoseHooverState:
+class NPTNoseHooverState(dataclasses.Settable):
   """State information for an NPT system with Nose-Hoover chain thermostats.
 
   Attributes:
@@ -709,7 +733,7 @@ class NPTNoseHooverState:
   position: Array
   momentum: Array
   force: Array
-  mass: Array
+  mass: Numeric
 
   reference_box: Box
 
@@ -736,7 +760,7 @@ class NPTNoseHooverState:
 
 def _npt_box_info(
   state: NPTNoseHooverState,
-) -> Tuple[float, Callable[[float], float]]:
+) -> Tuple[Array, Callable[[Array], Array]]:
   """Gets the current volume and a function to compute the box from volume."""
   dim = state.position.shape[1]
   ref = state.reference_box
@@ -828,7 +852,7 @@ def npt_nose_hoover(
 
     state = NPTNoseHooverState(
       R,
-      None,
+      jnp.zeros_like(R),
       force_fn(R, box=box, **kwargs),
       mass,
       box,
@@ -836,7 +860,7 @@ def npt_nose_hoover(
       box_momentum,
       box_mass,
       barostat.initialize(1, KE_box, _kT),
-      None,
+      thermostat.initialize(quantity.count_dof(R), zero, _kT),
     )  # pytype: disable=wrong-arg-count
     state = canonicalize_mass(state)
     state = initialize_momenta(state, key, _kT)
@@ -1043,7 +1067,7 @@ class Normal:
 
 
 @dataclasses.dataclass
-class NVTLangevinState:
+class NVTLangevinState(dataclasses.Settable):
   """A struct containing state information for the Langevin thermostat.
 
   Attributes:
@@ -1061,7 +1085,7 @@ class NVTLangevinState:
   position: Array
   momentum: Array
   force: Array
-  mass: Array
+  mass: Numeric
   rng: Array
 
   @property
@@ -1133,7 +1157,7 @@ def nvt_langevin(
     _kT = kwargs.pop('kT', kT)
     key, split = random.split(key)
     force = force_fn(R, **kwargs)
-    state = NVTLangevinState(R, None, force, mass, key)
+    state = NVTLangevinState(R, jnp.zeros_like(R), force, mass, key)
     state = canonicalize_mass(state)
     return initialize_momenta(state, split, _kT)
 
@@ -1271,7 +1295,7 @@ def hybrid_swap_mc(
   kT: float,
   t_md: float,
   N_swap: int,
-  sigma_fn: Optional[Callable[[Array], Array]] = None,
+  sigma_fn: Optional[Callable[[Array, Array], Array]] = None,
 ) -> Simulator:
   """Simulation of Hybrid Swap Monte-Carlo.
 
@@ -1322,8 +1346,9 @@ def hybrid_swap_mc(
   wrapped_energy_fn = lambda dr, sigma: energy_fn(dr, sigma)
   if sigma_fn is None:
     sigma_fn = lambda si, sj: 0.5 * (si + sj)
+  sigma_pair_fn = sigma_fn
   nbr_energy_fn = smap.pair_neighbor_list(
-    wrapped_energy_fn, metric_fn, sigma=sigma_fn
+    wrapped_energy_fn, metric_fn, sigma=sigma_pair_fn
   )
 
   nvt_init_fn, nvt_step_fn = nvt_nose_hoover(
@@ -1370,11 +1395,13 @@ def hybrid_swap_mc(
     dR = nbr_metric_fn(R_ij, R_neigh)
 
     # Compute the energy before the swap.
-    energy = energy_fn(dR, sigma_fn(sigma_ij, sigma_neigh))
+    energy = energy_fn(dR, sigma_pair_fn(sigma_ij, sigma_neigh))
     energy = jnp.sum(energy * (nbrs_ij < N))
 
     # Compute the energy after the swap.
-    new_energy = energy_fn(dR, sigma_fn(new_sigma_ij, new_sigma_neigh))
+    new_energy = energy_fn(
+      dR, sigma_pair_fn(new_sigma_ij, new_sigma_neigh)
+    )
     new_energy = jnp.sum(new_energy * (nbrs_ij < N))
 
     # Accept or reject with a metropolis probability.
@@ -1448,7 +1475,7 @@ def temp_rescale(
 
   def init_fn(key, R, mass=f32(1.0), **kwargs):
     # Reuse the NVEState dataclass
-    state = NVEState(R, None, force_fn(R, **kwargs), mass)
+    state = NVEState(R, jnp.zeros_like(R), force_fn(R, **kwargs), mass)
     state = canonicalize_mass(state)
     return initialize_momenta(state, key, kT)
 
@@ -1508,7 +1535,7 @@ def temp_berendsen(
 
   def init_fn(key, R, mass=f32(1.0), **kwargs):
     # Reuse the NVEState dataclass
-    state = NVEState(R, None, force_fn(R, **kwargs), mass)
+    state = NVEState(R, jnp.zeros_like(R), force_fn(R, **kwargs), mass)
     state = canonicalize_mass(state)
     return initialize_momenta(state, key, kT)
 
@@ -1602,7 +1629,7 @@ def nvk(
     return state.set(momentum=new_momentum)
 
   def position_update(state, shift_fn, **kwargs):
-    if isinstance(shift_fn, Callable):
+    if callable(shift_fn):
       shift_fn = tree_map(lambda r: shift_fn, state.position)
     # Get the new positions using Equation 4.16 (Should read r = r + dt * p / m)
     new_position = tree_map(
@@ -1617,7 +1644,7 @@ def nvk(
     _kT = kwargs.pop('kT', kT)
     key, split = random.split(key)
     # Reuse the NVEState dataclass
-    state = NVEState(R, None, force_fn(R, **kwargs), mass)
+    state = NVEState(R, jnp.zeros_like(R), force_fn(R, **kwargs), mass)
     state = canonicalize_mass(state)
     return initialize_momenta(state, split, _kT)
 
@@ -1734,7 +1761,9 @@ def temp_csvr(
     _kT = kwargs.pop('kT', kT)
     key, split = random.split(key)
     # Reuse the NVTLangevinState dataclass
-    state = NVTLangevinState(R, None, force_fn(R, **kwargs), mass, key)
+    state = NVTLangevinState(
+      R, jnp.zeros_like(R), force_fn(R, **kwargs), mass, key
+    )
     state = canonicalize_mass(state)
     return initialize_momenta(state, split, _kT)
 

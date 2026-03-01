@@ -32,6 +32,8 @@ features:
      that particles lose neighbors, the simulation will be correct.
 """
 
+from __future__ import annotations
+
 import functools
 
 import math

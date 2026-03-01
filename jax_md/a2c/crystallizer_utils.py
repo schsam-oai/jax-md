@@ -14,11 +14,15 @@
 
 """Utilities for a2c crystallizer."""
 
+from __future__ import annotations
+
 import itertools
+import logging
 import os
-from typing import Sequence, Any, List, Tuple, Optional, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 import numpy as onp
-import pymatgen as mg
+from pymatgen.core.composition import Composition
+from pymatgen.core.structure import Structure
 
 
 class Box(onp.ndarray):
@@ -47,14 +51,14 @@ class BoxColumnMatrix(Box):
 
 
 def get_subcells_to_crystallize(
-  structure: mg.core.Structure,
+  structure: Structure,
   d_frac: float = 0.05,
   nmin: int = 1,
   nmax: int = 48,
   restrict_to_compositions: Optional[Sequence[str]] = None,
   max_coef: Optional[int] = None,
   elements: Optional[Sequence[str]] = None,
-) -> List[Tuple[Sequence[int], onp.ndarray, onp.ndarray]]:
+) -> List[Tuple[onp.ndarray, onp.ndarray, onp.ndarray]]:
   """Get subcell structures to relax out of a large structure (e.g. amorphous).
 
   Args:
@@ -77,22 +81,24 @@ def get_subcells_to_crystallize(
 
   # If max_coef is given in config, we will restrict formulas to
   # stoich. of max_coef e.g. for 2, A, B, AB2, A2B.
+  allowed_compositions: Optional[set[str]]
   if max_coef:
+    assert elements is not None
     stoichs = list(itertools.product(range(max_coef + 1), repeat=len(elements)))
     stoichs.pop(0)
     comps = []
     for stoich in stoichs:
       comp = dict(zip(elements, stoich))
-      comps.append(mg.Composition.from_dict(comp).reduced_formula)
-    restrict_to_compositions = set(comps)
+      comps.append(Composition.from_dict(comp).reduced_formula)
+    allowed_compositions = set(comps)
 
   # If a composition list is provided, ensure they are reduced formulas
-  if restrict_to_compositions:
-    restrict_to_compositions = [
-      mg.Composition(i).reduced_formula for i in restrict_to_compositions
-    ]
+  elif restrict_to_compositions:
+    allowed_compositions = {
+      Composition(i).reduced_formula for i in restrict_to_compositions
+    }
   else:
-    restrict_to_compositions = None
+    allowed_compositions = None
 
   # Create orthorombic slices from the unit cube
   bins = int(1 / d_frac)
@@ -110,10 +116,9 @@ def get_subcells_to_crystallize(
       )
       ids = onp.argwhere(mask).flatten()  # indices of atoms in subcell
       if nmin <= len(ids) <= nmax:
-        if restrict_to_compositions:
-          if (
-            mg.Composition(''.join(species[ids])).reduced_formula
-            not in restrict_to_compositions
+        if allowed_compositions:
+          if Composition(''.join(species[ids])).reduced_formula not in (
+            allowed_compositions
           ):
             continue
         candidates.append((ids, l, h))
@@ -121,11 +126,11 @@ def get_subcells_to_crystallize(
 
 
 def subcells_to_structures(
-  candidates: List[Tuple[Sequence[int], onp.ndarray, onp.ndarray]],
+  candidates: List[Tuple[onp.ndarray, onp.ndarray, onp.ndarray]],
   position: onp.ndarray,
   box: Union[BoxColumnMatrix, BoxRowMatrix],
-  species: Sequence[str],
-) -> List[mg.core.Structure]:
+  species: Sequence[Any],
+) -> List[Structure]:
   """Create pymatgen Structure objects from subcell slices.
 
   Args:
@@ -150,7 +155,7 @@ def subcells_to_structures(
     new_pos = (pos - ldot) / (hdot - ldot)
     new_box = box * (hdot - ldot)
     structures.append(
-      mg.core.Structure(
+      Structure(
         new_box.T,  # back to row format expected by pymatgen
         onp.array(species)[ids].tolist(),
         coords=new_pos,
@@ -177,7 +182,7 @@ def get_candidate_subset(
 
 
 def valid_subcell(
-  structure: mg.core.Structure,
+  structure: Structure,
   initial_energy: float,
   final_energy: float,
   e_tol: float = 0.001,

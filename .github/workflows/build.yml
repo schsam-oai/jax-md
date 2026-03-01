@@ -32,6 +32,8 @@ jobs:
       run: uv run ruff check .
     - name: Run ruff format check
       run: uv run ruff format --check .
+    - name: Run pyright
+      run: uvx --from pyright==1.1.405 pyright
 
   test:
     runs-on: ubuntu-latest

@@ -1,5 +1,7 @@
 """Parameter management for OPLSAA forcefield."""
 
+from __future__ import annotations
+
 from jax_md.mm_forcefields.base import BondedParameters, NonbondedParameters
 from jax_md.util import Array
 from typing import NamedTuple

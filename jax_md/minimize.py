@@ -31,9 +31,11 @@ apply_fn:
   step of optimization.
 """
 
+from __future__ import annotations
+
 from collections import namedtuple
 
-from typing import TypeVar, Callable, Tuple, Union, Any
+from typing import Any, Callable, TypeVar
 
 import jax.numpy as jnp
 from jax.tree_util import tree_map, tree_reduce
@@ -48,6 +50,7 @@ from jax_md import simulate
 
 PyTree = Any
 Array = util.Array
+Numeric = util.Numeric
 f32 = util.f32
 f64 = util.f64
 
@@ -55,8 +58,8 @@ ShiftFn = space.ShiftFn
 
 T = TypeVar('T')
 InitFn = Callable[..., T]
-ApplyFn = Callable[[T], T]
-Minimizer = Tuple[InitFn, ApplyFn]
+ApplyFn = Callable[..., T]
+Minimizer = tuple[InitFn[T], ApplyFn[T]]
 
 
 def gradient_descent(
@@ -110,10 +113,10 @@ class FireDescentState:
   position: Array
   momentum: Array
   force: Array
-  mass: Array
-  dt: float
-  alpha: float
-  n_pos: int
+  mass: Numeric
+  dt: Array
+  alpha: Array
+  n_pos: Array
 
 
 def fire_descent(
@@ -158,27 +161,37 @@ def fire_descent(
       and Peter Gumbsch. "Structural relaxation made simple."
       Physical review letters 97, no. 17 (2006): 170201.
   """
-  dt_start, dt_max, n_min, f_inc, f_dec, alpha_start, f_alpha = (
-    util.static_cast(
-      dt_start, dt_max, n_min, f_inc, f_dec, alpha_start, f_alpha
-    )
-  )
+  (
+    dt_start_value,
+    dt_max_value,
+    n_min_value,
+    f_inc_value,
+    f_dec_value,
+    alpha_start_value,
+    f_alpha_value,
+  ) = util.static_cast(dt_start, dt_max, n_min, f_inc, f_dec, alpha_start, f_alpha)
 
-  nve_init_fn, nve_step_fn = simulate.nve(energy_or_force, shift_fn, dt_start)
+  _, nve_step_fn = simulate.nve(energy_or_force, shift_fn, dt_start)
   force = quantity.canonicalize_force(energy_or_force)
 
-  def init_fn(R: PyTree, mass: Array = 1.0, **kwargs) -> FireDescentState:
+  def init_fn(R: PyTree, mass: Numeric = 1.0, **kwargs) -> FireDescentState:
     P = tree_map(lambda x: jnp.zeros_like(x), R)
     n_pos = jnp.zeros((), jnp.int32)
     F = force(R, **kwargs)
     state = FireDescentState(
-      R, P, F, mass, dt_start, alpha_start, n_pos
+      R, P, F, mass, dt_start_value, alpha_start_value, n_pos
     )  # pytype: disable=wrong-arg-count
     return simulate.canonicalize_mass(state)
 
   def apply_fn(state: FireDescentState, **kwargs) -> FireDescentState:
     state = nve_step_fn(state, dt=state.dt, **kwargs)
-    R, P, F, M, dt, alpha, n_pos = dataclasses.unpack(state)
+    R = state.position
+    P = state.momentum
+    F = state.force
+    M = state.mass
+    dt = state.dt
+    alpha = state.alpha
+    n_pos = state.n_pos
 
     # NOTE(schsam): This will be wrong if F_norm ~< 1e-8.
     # TODO(schsam): We should check for forces below 1e-6. @ErrorChecking
@@ -203,15 +216,19 @@ def fire_descent(
 
     # NOTE(schsam): Can we clean this up at all?
     n_pos = jnp.where(F_dot_P >= 0, n_pos + 1, 0)
-    dt_choice = jnp.array([dt * f_inc, dt_max])
+    dt_choice = jnp.array([dt * f_inc_value, dt_max_value])
     dt = jnp.where(
-      F_dot_P > 0, jnp.where(n_pos > n_min, jnp.min(dt_choice), dt), dt
+      F_dot_P > 0,
+      jnp.where(n_pos > n_min_value, jnp.min(dt_choice), dt),
+      dt,
     )
-    dt = jnp.where(F_dot_P < 0, dt * f_dec, dt)
+    dt = jnp.where(F_dot_P < 0, dt * f_dec_value, dt)
     alpha = jnp.where(
-      F_dot_P > 0, jnp.where(n_pos > n_min, alpha * f_alpha, alpha), alpha
+      F_dot_P > 0,
+      jnp.where(n_pos > n_min_value, alpha * f_alpha_value, alpha),
+      alpha,
     )
-    alpha = jnp.where(F_dot_P < 0, alpha_start, alpha)
+    alpha = jnp.where(F_dot_P < 0, alpha_start_value, alpha)
     P = tree_map(lambda p: (F_dot_P >= 0) * p, P)
 
     return FireDescentState(

@@ -15,6 +15,8 @@
 # Demonstration of a2c method for the prediction of the crystallization products
 # of amorphous phases as described in https://arxiv.org/abs/2310.01117
 
+from __future__ import annotations
+
 import jax
 from jax import lax
 from jax import numpy as jnp
@@ -23,11 +25,12 @@ import numpy as np
 from absl import app
 from collections import defaultdict
 from tqdm import tqdm
+from pymatgen.core.composition import Composition
+from pymatgen.core.structure import Structure
 
 from jax_md import space, energy, quantity, simulate
 from jax_md.minimize import fire_descent
 
-import pymatgen as mg
 from pymatgen.analysis.structure_analyzer import SpacegroupAnalyzer
 from pymatgen.analysis.structure_matcher import StructureMatcher
 
@@ -55,11 +58,11 @@ def get_kt(step, equi_steps, cool_steps, T_high, T_low) -> float:
 
 def main(unused_argv):
   # We will make a 64-atom amorphous Si phase by melt-quench NVT-MD
-  composition = mg.core.Composition('Si64')
+  composition = Composition('Si64')
   box = jnp.array([[11.1, 0.0, 0.0], [0.0, 11.1, 0.0], [0.0, 0.0, 11.1]])
   # Get initial random packed structure with reduced overlap
   random_packed_structure = make_amorphous_utils.random_packed_structure(
-    composition, lattice=box, auto_diameter=True
+    composition, lattice=np.asarray(box), auto_diameter=True
   )
   displacement, shift = space.periodic_general(
     box, fractional_coordinates=True, wrapped=False
@@ -121,7 +124,7 @@ def main(unused_argv):
   # Run NVT-MD with the melt-quench-equilibrate temperature profile
   state, log = lax.fori_loop(0, steps, step_fn, (state, log))
   position = state.position
-  amorphous_structure = mg.core.Structure(
+  amorphous_structure = Structure(
     lattice=box.T,
     species=random_packed_structure.species,
     coords=state.position,
@@ -140,13 +143,13 @@ def main(unused_argv):
     subcell
     for subcell in subcells
     if np.all((subcell[2] - subcell[1]) == (subcell[2] - subcell[1])[0])
-    and subcell[0].shape[0] in (2, 4, 8)
+    and len(subcell[0]) in (2, 4, 8)
   ]
   print('Subcells kept for this example: %d' % len(subcells))
 
   structures = crystallizer_utils.subcells_to_structures(
     subcells,
-    box=box,
+    box=crystallizer_utils.BoxColumnMatrix(box),
     position=amorphous_structure.frac_coords,
     species=amorphous_structure.species,
   )
@@ -196,7 +199,7 @@ def main(unused_argv):
       / 3,
     )
     return (
-      mg.core.Structure(
+      Structure(
         lattice=box.T, species=s.species, coords=state.position
       ),
       log,
@@ -226,7 +229,7 @@ def main(unused_argv):
     spg_counter[sp] += 1
 
   print('All space groups encountered:', dict(spg_counter))
-  si_diamond = mg.core.Structure.from_str(
+  si_diamond = Structure.from_str(
     """Si
   1.0
   0.000000000000   2.732954000000   2.732954000000

@@ -4,21 +4,23 @@ Contains interaction list related functions for ReaxFF
 Author: Mehmet Cagri Kaymak
 """
 
+from __future__ import annotations
+
 from functools import partial
 from jax_md import space, partition, util
 from jax_md.mm_forcefields.reaxff.reaxff_energy import (
   calculate_bo,
   calculate_reaxff_energy,
 )
-from typing import Callable, Any, Tuple
+from typing import Any, Callable, Optional, Tuple, cast
 import jax
 import jax.numpy as jnp
 from jax_md import dataclasses
 from jax_md.util import safe_mask
 
 Array = util.Array
-MaskFn = Callable
-CandidateFn = Callable
+MaskFn = Callable[[Any], Array]
+CandidateFn = Callable[..., tuple[Array, Any]]
 # Types
 f32 = util.f32
 f64 = util.f64
@@ -63,7 +65,7 @@ class Filtration:
   candidate_fn: CandidateFn = dataclasses.static_field()
   mask_fn: MaskFn = dataclasses.static_field()
   is_dense: bool = dataclasses.static_field()
-  idx: Array
+  idx: Optional[Array]
   did_buffer_overflow: Array
 
   def count(self, candidate_args):
@@ -90,13 +92,13 @@ class Filtration:
       mapped_argwhere = jax.vmap(
         lambda vec: jnp.argwhere(vec, size=capacity, fill_value=-1).flatten()
       )
-      idx = mapped_argwhere(mask)
+      idx = cast(Array, mapped_argwhere(mask))
       did_buffer_overflow = self.did_buffer_overflow | (size > capacity)
 
     else:
       size = jnp.sum(mask)
       selected_inds = jnp.argwhere(mask, size=capacity, fill_value=-1).flatten()
-      idx = candidate_inds[selected_inds]
+      idx = cast(Array, candidate_inds[selected_inds])
       idx = jnp.where((selected_inds == -1).reshape(-1, 1), -1, idx)
       did_buffer_overflow = self.did_buffer_overflow | (size > capacity)
     return Filtration(
@@ -121,13 +123,13 @@ class Filtration:
       mapped_argwhere = jax.vmap(
         lambda vec: jnp.argwhere(vec, size=size, fill_value=-1).flatten()
       )
-      idx = mapped_argwhere(mask)
+      idx = cast(Array, mapped_argwhere(mask))
 
     else:
       size = int(jnp.sum(mask) * capacity_multiplier)
       size = max(min_capacity, size)
       selected_inds = jnp.argwhere(mask, size=size, fill_value=-1).flatten()
-      idx = candidate_inds[selected_inds]
+      idx = cast(Array, candidate_inds[selected_inds])
       idx = jnp.where((selected_inds == -1).reshape(-1, 1), -1, idx)
       # idx = candidate_inds[selected_inds] * (selected_inds != -1).reshape(-1,1)
     return Filtration(
@@ -144,26 +146,24 @@ class Filtration:
     """
     if self.idx is None:
       raise ValueError('Have to allocate first.')
+    assert self.idx is not None
 
     candidate_inds, candidate_vals = self.candidate_fn(*candidate_args)
     mask = self.mask_fn(candidate_vals)
     if self.is_dense:
       size = jnp.max(jnp.sum(mask, axis=1))
+      idx_capacity = self.idx.shape[1]
 
       mapped_argwhere = jax.vmap(
-        lambda vec: jnp.argwhere(
-          vec, size=self.idx.shape[1], fill_value=-1
-        ).flatten()
+        lambda vec: jnp.argwhere(vec, size=idx_capacity, fill_value=-1).flatten()
       )
-      idx = mapped_argwhere(mask)
-      did_buffer_overflow = self.did_buffer_overflow | (
-        size > self.idx.shape[1]
-      )
+      idx = cast(Array, mapped_argwhere(mask))
+      did_buffer_overflow = self.did_buffer_overflow | (size > idx_capacity)
     else:
       selected_inds = jnp.argwhere(
         mask, size=len(self.idx), fill_value=-1
       ).flatten()
-      idx = candidate_inds[selected_inds]
+      idx = cast(Array, candidate_inds[selected_inds])
       idx = jnp.where((selected_inds == -1).reshape(-1, 1), -1, idx)
       did_buffer_overflow = self.did_buffer_overflow | (
         jnp.sum(mask) > len(self.idx)
@@ -249,9 +249,9 @@ class ReaxFFNeighborLists:
   filter3: Filtration
   filter34: Filtration
   filter4: Filtration
-  filter_hb_close: Filtration
-  filter_hb_far: Filtration
-  filter_hb: Filtration
+  filter_hb_close: Optional[Filtration]
+  filter_hb_far: Optional[Filtration]
+  filter_hb: Optional[Filtration]
   did_buffer_overflow: Array
 
   def __iter__(self):
@@ -603,8 +603,8 @@ def reaxff_inter_list(
   backprop_solve: bool = False,
   tors_2013: bool = False,
   solver_model: str = 'EEM',
-  short_inters_capacity_multiplier: int = 1.2,
-  long_inters_capacity_multiplier: int = 1.2,
+  short_inters_capacity_multiplier: float = 1.2,
+  long_inters_capacity_multiplier: float = 1.2,
 ) -> Tuple[ReaxFFNeighborListFns, Callable]:
   """Contains all the necessary logic to run a reaxff simulation and allocate, reallocate, update and energy_fn functions.
 
@@ -924,6 +924,11 @@ def reaxff_inter_list(
       hb_ang_dist,
     ) = calculate_all_angles_and_distances(R, nbr_lists, map_metric, map_disp)
 
+    charge_guess = (
+      init_charges
+      if init_charges is not None
+      else jnp.zeros(species.shape, dtype=f32)
+    )
     energy, charges = calculate_reaxff_energy(
       species,
       species_AN,
@@ -934,7 +939,7 @@ def reaxff_inter_list(
       body_4_angles,
       hb_ang_dist,
       force_field,
-      init_charges,
+      charge_guess,
       total_charge,
       tol,
       max_solver_iter,

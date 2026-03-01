@@ -206,6 +206,8 @@ We include the license of the original code below:
    limitations under the License.
 """
 
+from __future__ import annotations
+
 from typing import Optional
 
 import e3nn_jax as e3nn
@@ -291,7 +293,7 @@ class Linear(nn.Module):
   irreps_in: Optional[Irreps] = None
 
   @nn.compact
-  def __call__(self, x: IrrepsArray) -> IrrepsArray:
+  def __call__(self, x: IrrepsArray | jax.Array) -> IrrepsArray:
     irreps_out = Irreps(self.irreps_out)
     irreps_in = Irreps(self.irreps_in) if self.irreps_in is not None else None
 
@@ -301,7 +303,8 @@ class Linear(nn.Module):
         '`irreps_in` must be specified'
       )
 
-    if irreps_in is not None:
+    if not isinstance(x, IrrepsArray):
+      assert irreps_in is not None
       x = IrrepsArray(irreps_in, x)
 
     x = x.remove_nones().simplify()

@@ -1,0 +1,27 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.10",
+  "include": [
+    "jax_md"
+  ],
+  "ignore": [
+    "jax_md/tpu.py"
+  ],
+  "typeCheckingMode": "strict",
+  "analyzeUnannotatedFunctions": true,
+  "strictListInference": true,
+  "strictDictionaryInference": true,
+  "strictSetInference": true,
+  "reportUnknownVariableType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownParameterType": "none",
+  "reportUnknownLambdaType": "none",
+  "reportMissingParameterType": "none",
+  "reportUnusedImport": "none",
+  "reportUnusedVariable": "none",
+  "reportConstantRedefinition": "none",
+  "reportMissingTypeArgument": "none",
+  "reportMissingTypeStubs": "none"
+}

@@ -14,9 +14,11 @@
 
 """Definitions of various standard energy functions."""
 
+from __future__ import annotations
+
 from functools import wraps, partial
 
-from typing import Callable, Tuple, TextIO, Dict, Any, Optional
+from typing import Callable, Tuple, TextIO, Dict, Any, Optional, cast
 
 import re
 
@@ -58,11 +60,15 @@ maybe_downcast = util.maybe_downcast
 f32 = util.f32
 f64 = util.f64
 Array = util.Array
+Numeric = util.Numeric
 
 PyTree = Any
 Box = space.Box
 DisplacementFn = space.DisplacementFn
 DisplacementOrMetricFn = space.DisplacementOrMetricFn
+ParameterValue = Numeric | list[Any] | tuple[Any, ...]
+TersoffParameterSet = dict[str, Any]
+TersoffParameters = TersoffParameterSet | list[TersoffParameterSet]
 
 NeighborFn = partition.NeighborFn
 NeighborList = partition.NeighborList
@@ -74,9 +80,9 @@ NeighborListFormat = partition.NeighborListFormat
 
 def simple_spring(
   dr: Array,
-  length: Array = 1,
-  epsilon: Array = 1,
-  alpha: Array = 2,
+  length: Numeric = 1,
+  epsilon: Numeric = 1,
+  alpha: Numeric = 2,
   **unused_kwargs,
 ) -> Array:
   """Isotropic spring potential with a given rest length.
@@ -91,9 +97,9 @@ def simple_spring_bond(
   displacement_or_metric: DisplacementOrMetricFn,
   bond: Array,
   bond_type: Optional[Array] = None,
-  length: Array = 1,
-  epsilon: Array = 1,
-  alpha: Array = 2,
+  length: Numeric = 1,
+  epsilon: Numeric = 1,
+  alpha: Numeric = 2,
 ) -> Callable[[Array], Array]:
   """Convenience wrapper to compute energy of particles bonded by springs."""
   length = maybe_downcast(length)
@@ -113,9 +119,9 @@ def simple_spring_bond(
 
 def soft_sphere(
   dr: Array,
-  sigma: Array = 1,
-  epsilon: Array = 1,
-  alpha: Array = 2,
+  sigma: Numeric = 1,
+  epsilon: Numeric = 1,
+  alpha: Numeric = 2,
   **unused_kwargs,
 ) -> Array:
   """.. _soft-sphere:
@@ -156,7 +162,9 @@ def soft_sphere(
   dr = dr / sigma
   fn = lambda dr: epsilon / alpha * (f32(1.0) - dr) ** alpha
 
-  if isinstance(alpha, int) or issubclass(type(alpha.dtype), jnp.integer):
+  if isinstance(alpha, int) or (
+    util.is_array(alpha) and jnp.issubdtype(alpha.dtype, jnp.integer)
+  ):
     return jnp.where(dr < 1.0, fn(dr), f32(0.0))
 
   return util.safe_mask(dr < 1.0, fn, dr, f32(0.0))
@@ -165,9 +173,9 @@ def soft_sphere(
 def soft_sphere_pair(
   displacement_or_metric: DisplacementOrMetricFn,
   species: Optional[Array] = None,
-  sigma: Array = 1.0,
-  epsilon: Array = 1.0,
-  alpha: Array = 2.0,
+  sigma: Numeric = 1.0,
+  epsilon: Numeric = 1.0,
+  alpha: Numeric = 2.0,
   per_particle: bool = False,
 ) -> Callable[[Array], Array]:
   """Convenience wrapper to compute :ref:`soft sphere energy <soft-sphere>` over a system."""
@@ -190,10 +198,10 @@ def soft_sphere_neighbor_list(
   displacement_or_metric: DisplacementOrMetricFn,
   box_size: Box,
   species: Optional[Array] = None,
-  sigma: Array = 1.0,
-  epsilon: Array = 1.0,
-  alpha: Array = 2.0,
-  dr_threshold: float = 0.2,
+  sigma: Numeric = 1.0,
+  epsilon: Numeric = 1.0,
+  alpha: Numeric = 2.0,
+  dr_threshold: Numeric = 0.2,
   per_particle: bool = False,
   fractional_coordinates: bool = False,
   format: NeighborListFormat = partition.OrderedSparse,
@@ -233,7 +241,7 @@ def soft_sphere_neighbor_list(
 
 
 def lennard_jones(
-  dr: Array, sigma: Array = 1, epsilon: Array = 1, **unused_kwargs
+  dr: Array, sigma: Numeric = 1, epsilon: Numeric = 1, **unused_kwargs
 ) -> Array:
   """.. _lj-pot:
 
@@ -261,10 +269,10 @@ def lennard_jones(
 def lennard_jones_pair(
   displacement_or_metric: DisplacementOrMetricFn,
   species: Optional[Array] = None,
-  sigma: Array = 1.0,
-  epsilon: Array = 1.0,
-  r_onset: Array = 2.0,
-  r_cutoff: Array = 2.5,
+  sigma: Numeric = 1.0,
+  epsilon: Numeric = 1.0,
+  r_onset: Numeric = 2.0,
+  r_cutoff: Numeric = 2.5,
   per_particle: bool = False,
 ) -> Callable[[Array], Array]:
   """Convenience wrapper to compute :ref:`Lennard-Jones energy <lj-pot>` over a system."""
@@ -287,11 +295,11 @@ def lennard_jones_neighbor_list(
   displacement_or_metric: DisplacementOrMetricFn,
   box_size: Box,
   species: Optional[Array] = None,
-  sigma: Array = 1.0,
-  epsilon: Array = 1.0,
-  r_onset: float = 2.0,
-  r_cutoff: float = 2.5,
-  dr_threshold: float = 0.5,
+  sigma: Numeric = 1.0,
+  epsilon: Numeric = 1.0,
+  r_onset: Numeric = 2.0,
+  r_cutoff: Numeric = 2.5,
+  dr_threshold: Numeric = 0.5,
   per_particle: bool = False,
   fractional_coordinates: bool = False,
   format: partition.NeighborListFormat = partition.OrderedSparse,
@@ -331,9 +339,9 @@ def lennard_jones_neighbor_list(
 
 def morse(
   dr: Array,
-  sigma: Array = 1.0,
-  epsilon: Array = 5.0,
-  alpha: Array = 5.0,
+  sigma: Numeric = 1.0,
+  epsilon: Numeric = 5.0,
+  alpha: Numeric = 5.0,
   **unused_kwargs,
 ) -> Array:
   """.. _morse-pot:
@@ -360,11 +368,11 @@ def morse(
 def morse_pair(
   displacement_or_metric: DisplacementOrMetricFn,
   species: Optional[Array] = None,
-  sigma: Array = 1.0,
-  epsilon: Array = 5.0,
-  alpha: Array = 5.0,
-  r_onset: float = 2.0,
-  r_cutoff: float = 2.5,
+  sigma: Numeric = 1.0,
+  epsilon: Numeric = 5.0,
+  alpha: Numeric = 5.0,
+  r_onset: Numeric = 2.0,
+  r_cutoff: Numeric = 2.5,
   per_particle: bool = False,
 ) -> Callable[[Array], Array]:
   """Convenience wrapper to compute :ref:`Morse energy <morse-pot>` over a system."""
@@ -387,12 +395,12 @@ def morse_neighbor_list(
   displacement_or_metric: DisplacementOrMetricFn,
   box_size: Box,
   species: Optional[Array] = None,
-  sigma: Array = 1.0,
-  epsilon: Array = 5.0,
-  alpha: Array = 5.0,
-  r_onset: float = 2.0,
-  r_cutoff: float = 2.5,
-  dr_threshold: float = 0.5,
+  sigma: Numeric = 1.0,
+  epsilon: Numeric = 5.0,
+  alpha: Numeric = 5.0,
+  r_onset: Numeric = 2.0,
+  r_cutoff: Numeric = 2.5,
+  dr_threshold: Numeric = 0.5,
   per_particle: bool = False,
   fractional_coordinates: bool = False,
   format: partition.NeighborListFormat = partition.OrderedSparse,
@@ -518,7 +526,7 @@ def gupta_gold55(displacement, cutoff=8.0):
 
 
 def multiplicative_isotropic_cutoff(
-  fn: Callable[..., Array], r_onset: float, r_cutoff: float
+  fn: Callable[..., Array], r_onset: Numeric, r_cutoff: Numeric
 ) -> Callable[..., Array]:
   """Takes an isotropic function and constructs a truncated function.
 
@@ -548,26 +556,29 @@ def multiplicative_isotropic_cutoff(
   r_c = r_cutoff ** f32(2)
   r_o = r_onset ** f32(2)
 
-  def smooth_fn(dr):
+  def smooth_fn(dr: Array) -> Array:
     r = dr ** f32(2)
 
-    inner = jnp.where(
+    inner = cast(
+      Array,
+      jnp.where(
       dr < r_cutoff,
       (r_c - r) ** 2 * (r_c + 2 * r - 3 * r_o) / (r_c - r_o) ** 3,
-      0,
+      f32(0.0),
+    ),
     )
 
-    return jnp.where(dr < r_onset, 1, inner)
+    return cast(Array, jnp.where(dr < r_onset, f32(1.0), inner))
 
   @wraps(fn)
-  def cutoff_fn(dr, *args, **kwargs):
+  def cutoff_fn(dr: Array, *args: Any, **kwargs: Any) -> Array:
     return smooth_fn(dr) * fn(dr, *args, **kwargs)
 
   return cutoff_fn
 
 
 def dsf_coulomb(
-  r: Array, Q_sq: Array, alpha: Array = 0.25, cutoff: float = 8.0
+  r: Array, Q_sq: Numeric, alpha: Numeric = 0.25, cutoff: float = 8.0
 ) -> Array:
   """Damped-shifted-force approximation of the coulombic interaction."""
   qqr2e = 332.06371  # Coulombic conversion factor: 1/(4*pi*epo).
@@ -584,12 +595,12 @@ def dsf_coulomb(
 
 def bks(
   dr: Array,
-  Q_sq: Array,
-  exp_coeff: Array,
-  exp_decay: Array,
-  attractive_coeff: Array,
-  repulsive_coeff: Array,
-  coulomb_alpha: Array,
+  Q_sq: Numeric,
+  exp_coeff: Numeric,
+  exp_decay: Numeric,
+  attractive_coeff: Numeric,
+  repulsive_coeff: Numeric,
+  coulomb_alpha: Numeric,
   cutoff: float,
   **unused_kwargs,
 ) -> Array:
@@ -639,12 +650,12 @@ def bks(
 def bks_pair(
   displacement_or_metric: DisplacementOrMetricFn,
   species: Array,
-  Q_sq: Array,
-  exp_coeff: Array,
-  exp_decay: Array,
-  attractive_coeff: Array,
-  repulsive_coeff: Array,
-  coulomb_alpha: Array,
+  Q_sq: ParameterValue,
+  exp_coeff: ParameterValue,
+  exp_decay: ParameterValue,
+  attractive_coeff: ParameterValue,
+  repulsive_coeff: ParameterValue,
+  coulomb_alpha: ParameterValue,
   cutoff: float,
 ) -> Callable[[Array], Array]:
   """Convenience wrapper to compute :ref:`BKS energy <bks-pot>` over a system."""
@@ -673,14 +684,14 @@ def bks_neighbor_list(
   displacement_or_metric: DisplacementOrMetricFn,
   box_size: Box,
   species: Array,
-  Q_sq: Array,
-  exp_coeff: Array,
-  exp_decay: Array,
-  attractive_coeff: Array,
-  repulsive_coeff: Array,
-  coulomb_alpha: Array,
+  Q_sq: ParameterValue,
+  exp_coeff: ParameterValue,
+  exp_decay: ParameterValue,
+  attractive_coeff: ParameterValue,
+  repulsive_coeff: ParameterValue,
+  coulomb_alpha: ParameterValue,
   cutoff: float,
-  dr_threshold: float = 0.8,
+  dr_threshold: Numeric = 0.8,
   fractional_coordinates: bool = False,
   format: partition.NeighborListFormat = partition.OrderedSparse,
   neighbor_list_fn: Callable = partition.neighbor_list,
@@ -742,7 +753,7 @@ BKS_SILICA_DICT = {
 }
 
 
-def _bks_silica_self(Q_sq: Array, alpha: Array, cutoff: float) -> Array:
+def _bks_silica_self(Q_sq: Numeric, alpha: Numeric, cutoff: float) -> Array:
   """Function for computing the self-energy contributions to BKS."""
   cutoffsq = cutoff * cutoff
   erfcc = erfc(alpha * cutoff)
@@ -1001,7 +1012,7 @@ def stillinger_weber_neighbor_list(
 # Tersoff model
 
 
-def load_lammps_tersoff_parameters(file: TextIO) -> Array:
+def load_lammps_tersoff_parameters(file: TextIO) -> list[dict[str, Any]]:
   """.. _ts-lammps:
 
   Reads Tersoff parameters from a LAMMPS file and returns parameter tables.
@@ -1018,8 +1029,9 @@ def load_lammps_tersoff_parameters(file: TextIO) -> Array:
   # start to read file.
   # todo: params_per_line becomes input variables.
   #       depending on the various type of tersoff model.
-  params = []
+  params: list[dict[str, Any]] = []
   params_per_line = 17
+  line_keep = ''
 
   # read parameters.
   # skip if the line has \# or empty
@@ -1219,7 +1231,7 @@ def _ters_repulsive(A: f64, lam1: f64, R: f64, D: f64, dr: Array) -> Array:
 
 def tersoff(
   displacement: DisplacementFn,
-  params: Array,
+  params: TersoffParameters,
   species: Optional[Array] = None,
 ) -> Callable[[Array], Array]:
   """Computes the Tersoff potential.
@@ -1245,7 +1257,7 @@ def tersoff(
   """
   # check number of parameters set.
   if species is None:
-    params = params[0]
+    param_set = params[0] if isinstance(params, list) else params
   else:
     raise NotImplementedError(
       'Multiple species is not implemented yet. '
@@ -1255,21 +1267,25 @@ def tersoff(
 
   # define a repulsive and an attractive function with given parameters.
   repulsive_fn = partial(
-    _ters_repulsive, params['A'], params['lam1'], params['R'], params['D']
+    _ters_repulsive,
+    param_set['A'],
+    param_set['lam1'],
+    param_set['R'],
+    param_set['D'],
   )
   attractive_fn = partial(
     _ters_attractive,
-    params['B'],
-    params['lam2'],
-    params['R'],
-    params['D'],
-    params['cTf'],
-    params['dTf'],
-    params['hTf'],
-    params['lam3'],
-    params['beta'],
-    params['nTf'],
-    params['mTf'],
+    param_set['B'],
+    param_set['lam2'],
+    param_set['R'],
+    param_set['D'],
+    param_set['cTf'],
+    param_set['dTf'],
+    param_set['hTf'],
+    param_set['lam3'],
+    param_set['beta'],
+    param_set['nTf'],
+    param_set['mTf'],
   )
 
   # define compute functions.
@@ -1278,7 +1294,12 @@ def tersoff(
     dR = space.map_product(d)(R, R)
     dr = space.distance(dR)
     N = R.shape[0]
-    mask = jnp.where(1 - jnp.eye(N), dr < params['R'] + params['D'], 0)
+    mask = cast(
+      Array,
+      jnp.where(
+        1 - jnp.eye(N), dr < param_set['R'] + param_set['D'], f32(0.0)
+      ),
+    )
     mask = mask.astype(R.dtype)
     mask_ijk = mask[:, None, :] * mask[:, :, None]
     repulsive = util.safe_mask(mask, repulsive_fn, dr)
@@ -1301,7 +1322,7 @@ def tersoff_from_lammps_parameters(
 def tersoff_neighbor_list(
   displacement: DisplacementFn,
   box_size: float,
-  params: Array,
+  params: TersoffParameters,
   species: Optional[Array] = None,
   dr_threshold: float = 0.5,
   disable_cell_list: bool = False,
@@ -1340,28 +1361,31 @@ def tersoff_neighbor_list(
   """
   # check number of parameters set
   if species is None:
-    params = params[0]
-    nparams = 1
+    param_set = params[0] if isinstance(params, list) else params
   else:
     raise NotImplementedError('Multiple species were not implemented yet.')
 
   # define a repulsive and an attractive function with given parameters
   repulsive_fn = partial(
-    _ters_repulsive, params['A'], params['lam1'], params['R'], params['D']
+    _ters_repulsive,
+    param_set['A'],
+    param_set['lam1'],
+    param_set['R'],
+    param_set['D'],
   )
   attractive_fn = partial(
     _ters_attractive,
-    params['B'],
-    params['lam2'],
-    params['R'],
-    params['D'],
-    params['cTf'],
-    params['dTf'],
-    params['hTf'],
-    params['lam3'],
-    params['beta'],
-    params['nTf'],
-    params['mTf'],
+    param_set['B'],
+    param_set['lam2'],
+    param_set['R'],
+    param_set['D'],
+    param_set['cTf'],
+    param_set['dTf'],
+    param_set['hTf'],
+    param_set['lam3'],
+    param_set['beta'],
+    param_set['nTf'],
+    param_set['mTf'],
   )
 
   # define a neighbor function.
@@ -1370,7 +1394,7 @@ def tersoff_neighbor_list(
     neighbor_fn = neighbor_list_fn(
       displacement,
       box_size,
-      params['R'] + params['D'],
+      param_set['R'] + param_set['D'],
       dr_threshold,
       disable_cell_list=disable_cell_list,
       fractional_coordinates=fractional_coordinates,
@@ -1452,7 +1476,7 @@ def _edip_radial_interaction(
   p_Z = jnp.exp(-beta * (Z_i**2))
   term1 = repul - p_Z
   term2 = jnp.exp(sigma / (r - cutoff))
-  return jnp.where(within_cutoff, A * term1 * term2, 0.0)
+  return cast(Array, jnp.where(within_cutoff, A * term1 * term2, f32(0.0)))
 
 
 def _edip_angle_interaction(
@@ -1489,7 +1513,7 @@ def _edip_angle_interaction(
   within_cutoff = (
     (dr12 > 0) & (dr13 > 0) & (jnp.linalg.norm(dR12 - dR13) > 1e-5)
   )
-  return jnp.where(within_cutoff, lam * term1 * term2, 0)
+  return cast(Array, jnp.where(within_cutoff, lam * term1 * term2, f32(0.0)))
 
 
 def edip(
@@ -1720,12 +1744,13 @@ def load_lammps_eam_parameters(
     float(temp_params[3]),
     float(temp_params[4]),
   )
+  data: Array
   if len(re.split(' +', raw_text[6].strip())) > 1:
-    data = [
+    data_parts = [
       maybe_downcast([float(i) for i in re.split(' +', rt.strip())])
       for rt in raw_text[6:]
     ]
-    data = jnp.concatenate(data)
+    data = jnp.concatenate(data_parts)
   else:
     data = maybe_downcast([float(i) for i in raw_text[6:-1]])
   embedding_fn = interpolate.spline(data[:num_drho], drho)
@@ -1735,11 +1760,21 @@ def load_lammps_eam_parameters(
   distances = jnp.arange(num_dr) * dr
   # Prevent dividing by zero at zero distance, which will not
   # affect the calculation
-  distances = jnp.where(distances == 0, f32(0.001), distances)
-  pairwise_fn = interpolate.spline(
-    data[num_dr + num_drho : num_drho + 2 * num_dr] / distances, dr
+  distances = cast(
+    Array, jnp.where(distances == 0, f32(0.001), distances)
   )
+  pairwise_data = data[num_dr + num_drho : num_drho + 2 * num_dr]
+  pairwise_fn = interpolate.spline(pairwise_data / distances, dr)
   return charge_fn, embedding_fn, pairwise_fn, cutoff
+
+
+def _diagonal_mask(X: Array) -> Array:
+  N = X.shape[0]
+  X = jnp.nan_to_num(X)
+  mask = f32(1.0) - jnp.eye(N, dtype=X.dtype)
+  if X.ndim == 3:
+    mask = jnp.reshape(mask, (N, N, 1))
+  return mask * X
 
 
 def eam(
@@ -1807,7 +1842,7 @@ def eam(
     total_charge = util.high_precision_sum(charge_fn(dr), axis=1)
     embedding_energy = embedding_fn(total_charge)
     pairwise_energy = util.high_precision_sum(
-      smap._diagonal_mask(pairwise_fn(dr)), axis=1
+      _diagonal_mask(pairwise_fn(dr)), axis=1
     ) / f32(2.0)
     return util.high_precision_sum(
       embedding_energy + pairwise_energy, axis=axis
@@ -2096,6 +2131,7 @@ def graph_network(
       _nodes = _canonicalize_node_state(kwargs['nodes'])
     else:
       _nodes = jnp.zeros((N, 1), R.dtype) if nodes is None else nodes
+    assert _nodes is not None
 
     edge_idx = jnp.broadcast_to(jnp.arange(N)[jnp.newaxis, :], (N, N))
     edge_idx = jnp.where(dr_2 < r_cutoff**2, edge_idx, N)
@@ -2169,6 +2205,7 @@ def graph_network_neighbor_list(
       _nodes = _canonicalize_node_state(kwargs['nodes'])
     else:
       _nodes = jnp.zeros((N, 1), R.dtype) if nodes is None else nodes
+    assert _nodes is not None
 
     _globals = jnp.zeros((1,), R.dtype)
 
@@ -2222,7 +2259,7 @@ def graph_network_neighbor_list(
 def nequip_neighbor_list(
   displacement_fn,
   box,
-  cfg: ConfigDict = None,
+  cfg: Optional[ConfigDict] = None,
   atoms=None,
   neighbor_list_fn: Callable = partition.neighbor_list,
   featurizer_fn: Callable = nn.util.neighbor_list_featurizer,
@@ -2271,7 +2308,7 @@ def nequip_neighbor_list(
     if _atoms is None:
       raise ValueError('A one-hot encoding of the atoms is required.')
     graph = featurizer(_atoms, position, neighbor, **kwargs)
-    return model.apply(params, graph)[0, 0]
+    return jnp.asarray(model.apply(params, graph))[0, 0]
 
   return neighbor_fn, init_fn, energy_fn
 
@@ -2323,6 +2360,6 @@ def load_gnome_model_neighbor_list(
     if _atoms is None:
       raise ValueError('A one-hot encoding of the atoms is required.')
     graph = featurizer(_atoms, position, neighbor, **kwargs)
-    return model.apply(params, graph)[0, 0]
+    return jnp.asarray(model.apply(params, graph))[0, 0]
 
   return neighbor_fn, energy_fn

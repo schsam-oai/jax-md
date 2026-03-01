@@ -6,6 +6,8 @@ This module provides coulomb energy functions that support:
 - Units in kcal/mol (common for MM forcefields)
 """
 
+from __future__ import annotations
+
 import jax.numpy as jnp
 from jax import vmap
 from jax.scipy.special import erfc

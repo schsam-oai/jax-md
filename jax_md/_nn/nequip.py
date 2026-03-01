@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
-from typing import Dict, Union, Tuple
+from __future__ import annotations
+
+from typing import Callable, Dict, Tuple, cast
 
 import functools
 
@@ -83,6 +85,52 @@ def tp_path_exists(arg_in1, arg_in2, arg_out):
   return False
 
 
+def _cfg_int(cfg: ConfigDict, key: str) -> int:
+  value = cfg.get(key)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  if isinstance(value, list | tuple):
+    value = value[0]
+  return int(value)
+
+
+def _cfg_bool(cfg: ConfigDict, key: str) -> bool:
+  value = cfg.get(key)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  return bool(value)
+
+
+def _cfg_float(cfg: ConfigDict, key: str) -> float:
+  value = cfg.get(key)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  if isinstance(value, list | tuple):
+    value = value[0]
+  return float(value)
+
+
+def _cfg_str(cfg: ConfigDict, key: str) -> str:
+  value = cfg.get(key)
+  if value is None:
+    raise ValueError(f'Missing config value: {key}')
+  return str(value)
+
+
+def _cfg_nonlinearities(cfg: ConfigDict) -> Dict[str, str]:
+  nonlinearities = cfg.get('nonlinearities')
+  if not isinstance(nonlinearities, dict):
+    raise ValueError('nonlinearities must be a dict with "e"/"o" keys.')
+  return {
+    'e': str(nonlinearities['e']),
+    'o': str(nonlinearities['o']),
+  }
+
+
+def _scalar_nonlinearity(name: str) -> Callable[[float], float]:
+  return cast(Callable[[float], float], get_nonlinearity_by_name(name))
+
+
 class NequIPConvolution(nn.Module):
   """NequIP Convolution.
 
@@ -109,7 +157,7 @@ class NequIPConvolution(nn.Module):
 
   hidden_irreps: Irreps
   use_sc: bool
-  nonlinearities: Union[str, Dict[str, str]]
+  nonlinearities: Dict[str, str]
   radial_net_nonlinearity: str = 'raw_swish'
   radial_net_n_hidden: int = 64
   radial_net_n_layers: int = 2
@@ -122,7 +170,7 @@ class NequIPConvolution(nn.Module):
     self,
     node_features: IrrepsArray,
     node_attributes: IrrepsArray,
-    edge_sh: Array,
+    edge_sh: IrrepsArray,
     edge_src: Array,
     edge_dst: Array,
     edge_embedded: Array,
@@ -182,6 +230,7 @@ class NequIPConvolution(nn.Module):
     # the node features where the weight matrix is indexed by the node
     # attributes (typically the chemical species), i.e. a linear transform
     # that is a function of the species of the central atom
+    self_connection: IrrepsArray | None = None
     if self.use_sc:
       self_connection = FullyConnectedTensorProductE3nn(
         h_out_irreps,
@@ -273,11 +322,12 @@ class NequIPConvolution(nn.Module):
     h_type = h.dtype
 
     e = edge_features.remove_zero_chunks().simplify()
-    h = e3nn.index_add(edge_dst, e, out_dim=h.shape[0])
+    edge_dst_idx = jnp.asarray(edge_dst, dtype=jnp.int32)
+    h = cast(IrrepsArray, e3nn.index_add(edge_dst_idx, e, out_dim=h.shape[0]))
     h = h.astype(h_type)
 
     # normalize by the average (not local) number of neighbors
-    h = h / self.n_neighbors
+    h = IrrepsArray(h.irreps, h.array / self.n_neighbors)
 
     # second linear, now we create extra gate scalars by mapping to h-out
     h = Linear(h_out_irreps)(h)
@@ -285,6 +335,7 @@ class NequIPConvolution(nn.Module):
     # self-connection, similar to a resnet-update that sums the output from
     # the TP to chemistry-weighted h
     if self.use_sc:
+      assert self_connection is not None
       h = h + self_connection
 
     # gate nonlinearity, applied to gate data, consisting of:
@@ -294,10 +345,10 @@ class NequIPConvolution(nn.Module):
     # in this order
     gate_fn = partial(
       e3nn.gate,
-      even_act=get_nonlinearity_by_name(self.nonlinearities['e']),
-      odd_act=get_nonlinearity_by_name(self.nonlinearities['o']),
-      even_gate_act=get_nonlinearity_by_name(self.nonlinearities['e']),
-      odd_gate_act=get_nonlinearity_by_name(self.nonlinearities['o']),
+      even_act=_scalar_nonlinearity(self.nonlinearities['e']),
+      odd_act=_scalar_nonlinearity(self.nonlinearities['o']),
+      even_gate_act=_scalar_nonlinearity(self.nonlinearities['e']),
+      odd_gate_act=_scalar_nonlinearity(self.nonlinearities['o']),
     )
 
     h = gate_fn(h)
@@ -339,7 +390,7 @@ class NequIPEnergyModel(nn.Module):
 
   graph_net_steps: int
   use_sc: bool
-  nonlinearities: Union[str, Dict[str, str]]
+  nonlinearities: Dict[str, str]
   n_elements: int
 
   hidden_irreps: str
@@ -373,7 +424,7 @@ class NequIPEnergyModel(nn.Module):
     # edge embedding
     dR = graph.edges
     scalar_dr_edge = space.distance(dR)
-    edge_sh = e3nn.spherical_harmonics(self.sh_irreps, dR, normalize=True)
+    edge_sh = e3nn.spherical_harmonics(Irreps(self.sh_irreps), dR, normalize=True)
 
     embedded_dr_edge = nn_util.BesselEmbedding(
       count=self.num_basis, inner_cutoff=r_max - 0.5, outer_cutoff=r_max
@@ -397,8 +448,9 @@ class NequIPEnergyModel(nn.Module):
       )(h_node, node_attrs, edge_sh, edge_src, edge_dst, embedded_dr_edge)
 
     # output block, two Linears that decay dimensions from h to h//2 to 1
+    mul_second_to_final = 1
     for mul, ir in h_node.irreps:
-      if ir == Irrep('0e'):
+      if ir.l == 0 and ir.p == 1:
         mul_second_to_final = mul // 2
 
     second_to_final_irreps = Irreps(f'{mul_second_to_final}x0e')
@@ -438,21 +490,21 @@ def model_from_config(cfg: ConfigDict) -> NequIPEnergyModel:
   shift, scale = nn_util.get_shift_and_scale(cfg)
 
   model = NequIPEnergyModel(
-    graph_net_steps=cfg.graph_net_steps,
-    use_sc=cfg.use_sc,
-    nonlinearities=cfg.nonlinearities,
-    n_elements=cfg.n_elements,
-    hidden_irreps=cfg.hidden_irreps,
-    sh_irreps=cfg.sh_irreps,
-    num_basis=cfg.num_basis,
-    r_max=cfg.r_max,
-    radial_net_nonlinearity=cfg.radial_net_nonlinearity,
-    radial_net_n_hidden=cfg.radial_net_n_hidden,
-    radial_net_n_layers=cfg.radial_net_n_layers,
+    graph_net_steps=_cfg_int(cfg, 'graph_net_steps'),
+    use_sc=_cfg_bool(cfg, 'use_sc'),
+    nonlinearities=_cfg_nonlinearities(cfg),
+    n_elements=_cfg_int(cfg, 'n_elements'),
+    hidden_irreps=_cfg_str(cfg, 'hidden_irreps'),
+    sh_irreps=_cfg_str(cfg, 'sh_irreps'),
+    num_basis=_cfg_int(cfg, 'num_basis'),
+    r_max=_cfg_float(cfg, 'r_max'),
+    radial_net_nonlinearity=_cfg_str(cfg, 'radial_net_nonlinearity'),
+    radial_net_n_hidden=_cfg_int(cfg, 'radial_net_n_hidden'),
+    radial_net_n_layers=_cfg_int(cfg, 'radial_net_n_layers'),
     shift=shift,
     scale=scale,
-    n_neighbors=cfg.n_neighbors,
-    scalar_mlp_std=cfg.scalar_mlp_std,
+    n_neighbors=_cfg_float(cfg, 'n_neighbors'),
+    scalar_mlp_std=_cfg_float(cfg, 'scalar_mlp_std'),
   )
 
   return model

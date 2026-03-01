@@ -49,7 +49,9 @@ without neighbor lists and yields a function that computes the total energy on
 a system of rigid bodies.
 """
 
-from typing import Optional, Tuple, Any, Union, Callable
+from __future__ import annotations
+
+from typing import Any, Callable, Optional, Tuple, Union, cast
 
 from absl import logging
 
@@ -70,6 +72,7 @@ import operator
 
 DType = Any
 Array = util.Array
+Numeric = util.Numeric
 PyTree = Any
 f64 = util.f64
 f32 = util.f32
@@ -148,7 +151,9 @@ def _quaternion_rotate(q: Array, v: Array) -> Array:
   return _quaternion_rotate_raw(q, v)
 
 
-def _quaternion_rotate_fwd(q: Array, v: Array) -> Array:
+def _quaternion_rotate_fwd(
+  q: Array, v: Array
+) -> Tuple[Array, Tuple[Array, Array]]:
   return _quaternion_rotate(q, v), (q, v)
 
 
@@ -198,7 +203,7 @@ class Quaternion:
     return 3 * reduce(operator.mul, self.vec.shape[:-1], 1)
 
   @property
-  def ndim(self) -> Tuple[int, ...]:
+  def ndim(self) -> int:
     return self.vec.ndim
 
   def conj(self):
@@ -407,13 +412,14 @@ def canonicalize_momentum(
   orientation = position.orientation
   p = momentum.orientation
   if isinstance(orientation, Quaternion):
+    assert isinstance(p, Quaternion)
     p = conjugate_momentum_to_angular_momentum(orientation, p)
   return RigidBody(momentum.center, p)
 
 
 def kinetic_energy(
   position: RigidBody, momentum: RigidBody, mass: RigidBody
-) -> float:
+) -> Numeric:
   """Computes the kinetic energy of a system with some momenta."""
   momentum = canonicalize_momentum(position, momentum)
   ke = tree_map(
@@ -424,7 +430,7 @@ def kinetic_energy(
 
 def temperature(
   position: RigidBody, momentum: RigidBody, mass: RigidBody
-) -> float:
+) -> Numeric:
   """Computes the temperature of a system with some momenta."""
   dof = quantity.count_dof(momentum)
   momentum = canonicalize_momentum(position, momentum)
@@ -625,7 +631,7 @@ def _(state, shift_fn, dt, m_rot=1, **kwargs):
 
 
 @simulate.stochastic_step.register(RigidBody)
-def _(state, dt: float, kT: float, gamma: float):
+def _(state, dt: float, kT: float, gamma: RigidBody):
   key, center_key, orientation_key = random.split(state.rng, 3)
 
   rest, center, orientation = split_center_and_orientation(state)
@@ -637,13 +643,14 @@ def _(state, dt: float, kT: float, gamma: float):
   Pi = orientation.momentum.vec
   I = orientation.mass
   G = gamma.orientation
+  assert not isinstance(G, Quaternion)
 
   M = 4 / jnp.sum(1 / I, axis=-1)
   Q = orientation.position.vec
   P = MOMENTUM_PERMUTATION
 
   # First evaluate PI term
-  Pi_mean = 0
+  Pi_mean = jnp.zeros_like(Pi)
   for l in range(3):
     I_l = I[:, [l], None]
     M_l = M[:, None, None]
@@ -652,7 +659,7 @@ def _(state, dt: float, kT: float, gamma: float):
   Pi_mean = jnp.einsum('nij,nj->ni', Pi_mean, Pi)
 
   # Then evaluate Q term
-  Pi_var = 0
+  Pi_var = jnp.zeros_like(Pi)
   for l in range(3):
     scale = jnp.sqrt(
       4 * kT * I[:, l] * (1 - jnp.exp(-M * G * dt / (2 * I[:, l])))
@@ -680,12 +687,12 @@ def _(state):
 
 
 @simulate.kinetic_energy.register(RigidBody)
-def _(state) -> Array:
+def _(state) -> Numeric:
   return kinetic_energy(state.position, state.momentum, state.mass)
 
 
 @simulate.temperature.register(RigidBody)
-def _(state) -> Array:
+def _(state) -> Numeric:
   return temperature(state.position, state.momentum, state.mass)
 
 
@@ -705,7 +712,7 @@ and it would be interesting to explore other possibilities.
 
 
 @dataclasses.dataclass
-class RigidPointUnion:
+class RigidPointUnion(dataclasses.Settable):
   """.. _rigid_body_union:
 
   Defines a rigid collection of point-like masses glued together.
@@ -849,7 +856,9 @@ def _transform_to_diagonal_frame(shape: RigidPointUnion) -> RigidPointUnion:
   assert len(shape.point_count) == 1
 
   if ndim == 2:
-    total_mass = shape._sum_over_shapes(shape.masses[:, None] * shape.points)
+    total_mass = jnp.sum(
+      shape.masses[:, None] * shape.points, axis=0, keepdims=True
+    )
     com = total_mass / shape.point_count[:, None]
     return shape.set(points=shape.points - com)
   elif ndim == 3:
@@ -904,7 +913,7 @@ def concatenate_shapes(*shapes) -> RigidPointUnion:
       'should have point species.'
     )
   if any_point_species and not all(
-    isinstance(x, (Array, onp.ndarray)) for x in point_species
+    isinstance(x, jnp.ndarray | onp.ndarray) for x in point_species
   ):
     raise ValueError(
       'All point species should be specified as `onp.ndarray` '
@@ -956,12 +965,12 @@ def union_to_points(
     position = vmap(transform, (0, None))(body, shape)
     point_species = shape.point_species
     if point_species is not None:
-      point_species = shape.point_species[None, :]
+      point_species = point_species[None, :]
       point_species = jnp.broadcast_to(point_species, position.shape[:-1])
       point_species = jnp.reshape(point_species, (-1,))
     position = jnp.reshape(position, (-1, position.shape[-1]))
     return position, point_species
-  elif isinstance(shape_species, onp.ndarray):
+  else:
     shape_species_types = onp.unique(shape_species)
     shape_species_count = len(shape_species_types)
     assert (
@@ -980,7 +989,7 @@ def union_to_points(
 
       ps = cur_shape.point_species
       if ps is not None:
-        ps = cur_shape.point_species[None, :]
+        ps = ps[None, :]
         ps = jnp.broadcast_to(ps, pos.shape[:-1])
         point_species += [jnp.reshape(ps, (-1,))]
 
@@ -989,12 +998,6 @@ def union_to_points(
     point_position = jnp.concatenate(point_position)
     point_species = jnp.concatenate(point_species) if point_species else None
     return point_position, point_species
-  else:
-    raise NotImplementedError(
-      'Shape species must either be None or of type '
-      'onp.ndarray since it must be specified ahead '
-      f'of compilation. Found {type(shape_species)}.'
-    )
 
 
 # Energy Functions

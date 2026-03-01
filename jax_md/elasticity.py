@@ -59,6 +59,8 @@ approximations.
 
 """
 
+from __future__ import annotations
+
 from functools import partial
 from typing import Dict, Callable, Union
 from absl import logging
@@ -184,10 +186,10 @@ def _convert_responses_to_elastic_constants(response_all: Array) -> Array:
 def athermal_moduli(
   energy_fn: Callable[..., Array],
   tether_strength: float = 1e-10,
-  gradient_check: Array = None,
+  gradient_check: Array | None = None,
   cg_tol: float = 1e-7,
   check_convergence: bool = False,
-) -> Callable[..., Array]:
+) -> Callable[..., Array | tuple[Array, Array]]:
   """Setup calculation of elastic modulus tensor.
 
   Args:
@@ -222,7 +224,9 @@ def athermal_moduli(
   Return: A function to calculate the elastic modulus tensor
   """
 
-  def calculate_emt(R: Array, box: Array, **kwargs) -> Array:
+  def calculate_emt(
+    R: Array, box: Array, **kwargs
+  ) -> Array | tuple[Array, Array]:
     """Calculate the elastic modulus tensor.
 
     `energy_fn(R)` corresponds to the state around which we are expanding
@@ -455,16 +459,16 @@ def mandel_to_tensor(M: Array) -> Array:
 
   if rank == 1:
 
-    def extract(i, j):
+    def extract_rank_1(i, j):
       idx = mandel_index(i, j)
       return M[idx] / weight[idx]
 
-    T = vmap(vmap(extract, in_axes=(0, None)), in_axes=(None, 0))(
+    T = vmap(vmap(extract_rank_1, in_axes=(0, None)), in_axes=(None, 0))(
       tensor_range, tensor_range
     )
   else:
 
-    def extract(i, j, k, l):
+    def extract_rank_2(i, j, k, l):
       idx0 = mandel_index(i, j)
       idx1 = mandel_index(k, l)
       return M[idx0, idx1] / (weight[idx0] * weight[idx1])
@@ -472,7 +476,7 @@ def mandel_to_tensor(M: Array) -> Array:
     T = vmap(
       vmap(
         vmap(
-          vmap(extract, in_axes=(0, None, None, None)),
+          vmap(extract_rank_2, in_axes=(0, None, None, None)),
           in_axes=(None, 0, None, None),
         ),
         in_axes=(None, None, 0, None),
