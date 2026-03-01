@@ -906,10 +906,6 @@ def neighbor_list(
     A NeighborListFns object that contains a method to allocate a new neighbor
     list and a method to update an existing neighbor list.
   """
-  sparse_backend = (
-    'direct' if use_experimental_sparse_neighbor_list else 'legacy'
-  )
-
   is_format_valid(format)
   box = lax.stop_gradient(box)
   r_cutoff = lax.stop_gradient(r_cutoff)
@@ -931,7 +927,7 @@ def neighbor_list(
 
   def direct_sparse_supported() -> bool:
     return (
-      sparse_backend == 'direct'
+      use_experimental_sparse_neighbor_list
       and is_sparse(format)
       and not disable_cell_list
       and (custom_mask_function is None or custom_mask_uses_edges)

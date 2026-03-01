@@ -304,7 +304,7 @@ class NeighborListTest(test_util.JAXMDTestCase):
       for fmt in [partition.Sparse, partition.OrderedSparse]
     )
   )
-  def test_neighbor_list_direct_sparse_backend_matches_legacy(
+  def test_neighbor_list_experimental_sparse_neighbor_list_matches_legacy(
     self, dtype, dim, format
   ):
     key = random.PRNGKey(7)
@@ -341,7 +341,7 @@ class NeighborListTest(test_util.JAXMDTestCase):
       for fmt in [partition.Sparse, partition.OrderedSparse]
     )
   )
-  def test_neighbor_list_direct_sparse_backend_matches_legacy_fractional_box(
+  def test_neighbor_list_experimental_sparse_neighbor_list_matches_legacy_fractional_box(
     self, dtype, dim, format
   ):
     key = random.PRNGKey(11)
@@ -389,7 +389,7 @@ class NeighborListTest(test_util.JAXMDTestCase):
       for fmt in [partition.Sparse, partition.OrderedSparse]
     )
   )
-  def test_neighbor_list_direct_sparse_backend_matches_legacy_runtime_box(
+  def test_neighbor_list_experimental_sparse_neighbor_list_matches_legacy_runtime_box(
     self, dtype, dim, format
   ):
     key = random.PRNGKey(13)
